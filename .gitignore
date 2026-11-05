@@ -1,0 +1,72 @@
+# Python 환경·빌드·캐시
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+/dist/
+/build/
+
+# Jupyter 임시 파일 (연구 노트북은 버전 관리)
+.ipynb_checkpoints/
+
+# 모델 가중치·실험 결과·데이터 snapshot
+/models/
+/runs/
+*.safetensors
+*.gguf
+*.onnx
+pytorch_model*.bin
+*.log
+*.log.*
+
+# 로컬 편집기·에이전트 설정
+.vscode/
+.idea/
+.codex/
+
+# 비밀 설정과 인증 자료
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.json
+token.json
+service-account*.json
+service_account*.json
+client_secret*.json
+client-secret*.json
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*-private.pem
+private*.pem
+.git-credentials
+.npmrc
+.pypirc
+.netrc
+.ssh/
+.aws/
+.azure/
+.config/gcloud/
+.kube/
+
+# 운영체제 메타데이터
+.DS_Store
+Thumbs.db
+desktop.ini
+!/tests/test_notebook_flow.py
+!/tests/test_monitor_races.py
