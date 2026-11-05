@@ -38,7 +38,7 @@ def _check(value, action):
 
 
 class _PdhCounters:
-    def __init__(self, pid):
+    def __init__(self, pid=None, english_path=None):
         if os.name != "nt":
             raise OSError("Windows PDH is unavailable on this OS")
         self.dll = ct.WinDLL("pdh.dll")
@@ -59,8 +59,8 @@ class _PdhCounters:
         _check(self.dll.PdhOpenQueryW(None, 0, ct.byref(self.query)), "open query")
         seed = HANDLE()
         try:
-            # 정확한 PID 접두사만 요청한다. 다른 프로세스의 counter를 합산하지 않는다.
-            english = rf"\GPU Process Memory(pid_{int(pid)}_*)\Dedicated Usage"
+            # 기본 프로세스 카운터는 PID를 제한하며, adapter 사용량 경로는 별도로 지정한다.
+            english = english_path or rf"\GPU Process Memory(pid_{int(pid)}_*)\Dedicated Usage"
             _check(self.dll.PdhAddEnglishCounterW(self.query, english, 0, ct.byref(seed)), "add English counter")
             size = DWORD(0)
             code = self.dll.PdhGetCounterInfoW(seed, 0, ct.byref(size), None)
@@ -80,13 +80,13 @@ class _PdhCounters:
             if seed and self.query:
                 self.dll.PdhRemoveCounter(seed)
 
-    def read(self):
+    def read_named(self):
         size = DWORD(0)
         code = self.dll.PdhExpandWildCardPathW(None, self.localized, None, ct.byref(size), 0)
         if _code(code) != MORE_DATA:
             _check(code, "expand counter size")
         if not size.value:
-            return []
+            return {}
         paths = ct.create_unicode_buffer(size.value)
         _check(self.dll.PdhExpandWildCardPathW(None, self.localized, paths, ct.byref(size), 0), "expand counters")
         current = set("".join(paths[:size.value]).strip("\0").split("\0"))
@@ -98,18 +98,21 @@ class _PdhCounters:
             _check(self.dll.PdhAddCounterW(self.query, path, 0, ct.byref(counter)), "add localized counter")
             self.counters[path] = counter
         if not self.counters:
-            return []
+            return {}
         _check(self.dll.PdhCollectQueryData(self.query), "collect")
-        values = []
-        for counter in self.counters.values():
+        values = {}
+        for path, counter in self.counters.items():
             value = _Value()
             code = self.dll.PdhGetFormattedCounterValue(counter, FMT_LARGE | FMT_NOSCALE, None, ct.byref(value))
             if _code(code) == 0:
-                values.append((value.status, value.value.large))
+                values[path] = (value.status, value.value.large)
             else:
                 # 일부 adapter만 성공한 합계는 실제 프로세스 값으로 보고하지 않는다.
-                values.append((_code(code), 0))
+                values[path] = (_code(code), 0)
         return values
+
+    def read(self):
+        return list(self.read_named().values())
 
     def close(self):
         if getattr(self, "query", None):

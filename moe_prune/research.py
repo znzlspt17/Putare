@@ -11,12 +11,14 @@ import random
 import re
 import statistics
 import subprocess
+import sys
 import time
 import unicodedata
 import platform
 import importlib.metadata
 
 from .gguf import GGUF, sha256, validate_allowlist
+from .memory_safety import MemoryGuard
 
 
 def canonical_hash(value):
@@ -204,10 +206,8 @@ class Experiment:
             if not self.manifest["stages"].get(gate, {}).get("equivalent", False):
                 raise RuntimeError(f"실측 동등성 게이트가 필요합니다: {gate}")
 
-    def run(self, name, request, timeout_s=1800):
-        """2026-11-05: stdout/stderr는 파일로 흘리고 프로세스 트리 RAM을 감시한다."""
-        import psutil
-        from tools.native.gpu_memory import ProcessGpuMemorySampler
+    def run(self, name, request, timeout_s=None):
+        """2026-11-05: 시간 대신 물리·commit·GPU 메모리 여유를 감시한다."""
         folder = self.root / "jobs" / name
         request = {**request, "seed": request.get("seed", self.config["seed"]),
                    "context_size": request.get("context_size", self.config["context_size"])}
@@ -230,6 +230,31 @@ class Experiment:
             if (folder / "measurement.json").exists():
                 return self.result(folder)
             raise RuntimeError(f"미완료 job입니다. 원인 확인 후 다른 이름을 사용하세요: {folder}")
+        guard = MemoryGuard(self.config, request)
+        try:
+            try:
+                preflight = guard.preflight()
+            except Exception as error:
+                # 2026-11-05: 재시도를 막는 job 폴더는 만들지 않고 사전 차단 근거만 보존한다.
+                try:
+                    write_json(self.root / 'preflight-failures' / f'{name}.json',
+                               {'reason': str(error), 'error_type': type(error).__name__, 'memory_last': guard.last})
+                except Exception as record_error:
+                    error.add_note(f'사전 차단 기록 실패: {record_error}')
+                raise
+            return self._execute_job(folder, request, identity, executable, guard, preflight, timeout_s)
+        finally:
+            active_error = sys.exception()
+            try:
+                guard.close()
+            except Exception as close_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f'메모리 감시 종료 실패: {close_error}')
+
+    def _execute_job(self, folder, request, identity, executable, guard, preflight, timeout_s):
+        import psutil
+        from tools.native.gpu_memory import ProcessGpuMemorySampler
         folder.mkdir(parents=True)
         write_json(folder / "request.json", request)
         write_json(folder / "identity.json", identity)
@@ -238,16 +263,18 @@ class Experiment:
         started, peak, failure = time.perf_counter(), None, None
         with (folder / "stdout.log").open("wb") as out, (folder / "stderr.log").open("wb") as err:
             process = subprocess.Popen([str(executable.resolve()), "--request", str((folder / "request.json").resolve()), "--output", str((folder / "events.jsonl").resolve())], stdout=out, stderr=err)
-            monitor = None
-            gpu_sampler = ProcessGpuMemorySampler(process.pid)
+            monitor, gpu_sampler = None, None
             try:
+                gpu_sampler = ProcessGpuMemorySampler(process.pid)
                 try:
                     monitor = psutil.Process(process.pid)
                 except psutil.NoSuchProcess:
                     # 2026-11-05: 빠른 종료는 실패나 RSS=0이 아니라 미관측으로 처리한다.
                     pass
                 while process.poll() is None:
+                    guard.check()
                     if monitor is None:
+                        # PID가 이미 사라진 경우에는 wait로 종료 상태를 수거한다.
                         break
                     gpu_sampler.sample()
                     try:
@@ -263,32 +290,50 @@ class Experiment:
                             continue
                     if sampled:
                         peak = total if peak is None else max(peak, total)
-                    if total > self.config["ram_budget_bytes"]:
-                        raise MemoryError("40GB RAM 예산 초과")
-                    if psutil.virtual_memory().available < 1024 ** 3:
-                        raise MemoryError("시스템 가용 RAM 1GiB 미만")
-                    if time.perf_counter() - started > timeout_s:
+                    budget = self.config.get("ram_budget_bytes")
+                    if budget is not None and total > budget:
+                        raise MemoryError("프로세스 RAM 예산 초과")
+                    if timeout_s is not None and time.perf_counter() - started > timeout_s:
                         raise TimeoutError("실험 job timeout")
                     time.sleep(.1)
                 # poll 이전/관측 도중 종료해도 실제 returncode를 반드시 수거한다.
                 process.wait()
             except BaseException as exc:
                 failure = str(exc)
+                cleanup_errors = []
                 try:
                     children = monitor.children(recursive=True) if monitor is not None else []
                 except psutil.NoSuchProcess:
+                    children = []
+                except Exception as error:
+                    cleanup_errors.append(f'children: {type(error).__name__}: {error}')
                     children = []
                 for child in children:
                     try:
                         child.kill()
                     except psutil.NoSuchProcess:
                         pass
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-                gpu_measurement = gpu_sampler.snapshot()
-                gpu_sampler.close()
-                write_json(folder / "failure.json", {"reason": failure, "peak_ram_bytes": peak, "os_gpu_memory": gpu_measurement})
+                    except Exception as error:
+                        cleanup_errors.append(f'child kill: {type(error).__name__}: {error}')
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                except Exception as error:
+                    cleanup_errors.append(f'parent kill/wait: {type(error).__name__}: {error}')
+                gpu_measurement = None
+                try:
+                    if gpu_sampler:
+                        gpu_measurement = gpu_sampler.snapshot()
+                        gpu_sampler.close()
+                except Exception as error:
+                    cleanup_errors.append(f'gpu sampler: {type(error).__name__}: {error}')
+                try:
+                    write_json(folder / "failure.json", {"reason": failure, "peak_ram_bytes": peak, "os_gpu_memory": gpu_measurement,
+                                                         "memory_preflight": preflight, "memory_last": guard.last,
+                                                         "cleanup_errors": cleanup_errors})
+                except Exception as error:
+                    exc.add_note(f'실패 기록 저장 실패: {error}')
                 raise
             gpu_measurement = gpu_sampler.snapshot()
             gpu_sampler.close()
@@ -296,7 +341,7 @@ class Experiment:
             write_json(folder / "failure.json", {"returncode": process.returncode, "peak_ram_bytes": peak})
             raise RuntimeError(f"native job 실패: {folder / 'stderr.log'}")
         write_json(folder / "measurement.json", {"peak_process_tree_rss_bytes": peak, "wall_s": time.perf_counter() - started,
-                                                "os_gpu_memory": gpu_measurement})
+                                                "os_gpu_memory": gpu_measurement, "memory_preflight": preflight, "memory_last": guard.last})
         return self.result(folder)
 
     @staticmethod

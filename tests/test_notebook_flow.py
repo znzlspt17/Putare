@@ -70,7 +70,10 @@ class NotebookFlowTests(unittest.TestCase):
             namespace = {"__name__": "__notebook_synthetic_test__"}
             with patch("moe_prune.research.source_revision", return_value={"git_commit": "synthetic", "git_dirty": False}), \
                  patch("moe_prune.research.subprocess.Popen", side_effect=SyntheticNative), \
+                 patch("moe_prune.memory_safety._available_memory", return_value=(64 * 1024**3, 64 * 1024**3)), \
+                 patch("moe_prune.memory_safety.AdapterMemory") as adapter, \
                  patch("psutil.Process"), contextlib.redirect_stdout(io.StringIO()):
+                adapter.return_value.sample.return_value = (16 * 1024**3, 0)
                 for keep, previous in ((120, None), (96, 120)):
                     configured = False
                     for index, cell in enumerate(notebook.cells):

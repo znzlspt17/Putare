@@ -63,7 +63,12 @@ RUN_ID = 'gemma4-exploration-001'
 DATA = ROOT / 'runs/datasets/snapshot-001'
 GPU_TARGET = 'gfx1201'  # 실제 HIP 장치와 일치하는지 실행 전 확인
 CONFIG = {'seed': 42, 'context_size': 8192, 'n_gpu_layers': 99,
-          'ram_budget_bytes': 40_000_000_000, 'engine': str(ENGINE.resolve())}
+          'ram_budget_bytes': None,  # 고정 RSS 상한 없이 실제 시스템 여유를 감시
+          'min_available_ram_bytes': 4 * 1024**3,
+          'min_available_commit_bytes': 4 * 1024**3,
+          'min_free_vram_bytes': 1 * 1024**3,
+          'vram_workspace_bytes': 1 * 1024**3,
+          'engine': str(ENGINE.resolve())}
 CALIBRATION_N = 16       # 점검 16 → 탐색 64; 바꾸면 데이터 snapshot과 RUN_ID도 변경
 SELECTION_N = 16
 EVALUATION_N = 16        # 전체 평가는 None, 별도 RUN_ID로 실행
@@ -81,7 +86,13 @@ md("""
 Python 데이터 도구, GGUF 바이트 절삭기와 **llama.cpp HIP 실험용 엔진**을 사용합니다. Strata/Unsloth 프레임워크를 실행하지 않습니다.
 `requirements-research.txt`는 기존 ROCm lock과 별도입니다. 설치 셀은 사용자 실행 전용입니다.
 엔진은 `tools/native/README.md`의 pinned revision을 사용합니다. CMake·C++ 빌드 도구·HIP SDK가 필요합니다.
-40GB는 실험 프로세스 트리의 RSS 예산이며 OS/드라이버 전체 메모리를 보장하는 값이 아닙니다.
+시간 제한은 없습니다. 작업이 몇 시간 걸려도 메모리 여유가 유지되면 계속합니다.
+고정 40GB RSS 상한 대신 시스템 가용 RAM·Windows commit 여유를 각각 4GiB,
+GPU 전체 사용량 기준 VRAM 여유를 1GiB 남기도록 시작 전·실행 중 감시합니다.
+시작 전에는 GGUF 파일 크기 + workspace 추정 1GiB + VRAM 여유 1GiB를 요구합니다.
+workspace는 KV/계산 버퍼의 정확한 필요량이 아니며, 순간 할당과 드라이버 장애까지 보장하지 않습니다.
+메모리 관측이 불가능하거나 여유가 부족하면 중단하고 원인을 기록합니다.
+이전 실행과 CONFIG가 달라졌다면 새 RUN_ID를 사용하세요. 실패한 작업은 자동 재시도하지 않습니다.
 엔진 GPU 할당 실패는 중단하며, CPU fallback으로 속도 결과를 조용히 대체하지 않습니다.
 """)
 code("""
