@@ -53,16 +53,18 @@ PREPARE_ENGINE = False
 BUILD_ENGINE = False
 DOWNLOAD_DATA = False
 RUN_MODEL = False
+RUN_PRUNING_ANALYSIS = False  # 원본 품질·속도만 측정하려면 False 유지
 WRITE_MODELS = False
 RUN_EVALUATION = False
 RUN_BENCHMARK = False
 
 MODEL = ROOT / 'models/gemma-4-26B-A4B-it-UD-IQ4_NL.gguf'
 ENGINE = ROOT / '.cache/llama-build/bin/llama-expert-research.exe'
-RUN_ID = 'gemma4-exploration-001'
+RUN_ID = 'gemma4-pruning-120-001'
 DATA = ROOT / 'runs/datasets/snapshot-001'
 GPU_TARGET = 'gfx1201'  # 실제 HIP 장치와 일치하는지 실행 전 확인
-CONFIG = {'seed': 42, 'context_size': 8192, 'n_gpu_layers': 99,
+# RX 9070 XT에서 확인한 분산 적재 설정: 반복 레이어 23개+출력은 GPU, 앞 7개는 CPU/RAM.
+CONFIG = {'seed': 42, 'context_size': 16384, 'n_gpu_layers': 24,
           'ram_budget_bytes': None,  # 고정 RSS 상한 없이 실제 시스템 여유를 감시
           'min_available_ram_bytes': 4 * 1024**3,
           'min_available_commit_bytes': 4 * 1024**3,
@@ -73,7 +75,7 @@ CALIBRATION_N = 16       # 점검 16 → 탐색 64; 바꾸면 데이터 snapshot
 SELECTION_N = 16
 EVALUATION_N = 16        # 전체 평가는 None, 별도 RUN_ID로 실행
 PROFILE_OUTPUT_TOKENS = 128
-GENERATION_TOKENS = 1024
+GENERATION_TOKENS = 8192
 ABLATION_BUDGET = 8      # 일부 후보만 점검, 전체 Critical Expert 검증이 아님
 APPROVED_KEEP_COUNTS = [120]  # 120개 대응·품질 검토 후 직접 96/64/32를 추가
 PRIOR_SELECTION_REVIEW_HASH = None  # 더 작은 모델은 이전 단계 Selection 실측 요약의 hash를 확인 후 입력
@@ -89,11 +91,14 @@ Python 데이터 도구, GGUF 바이트 절삭기와 **llama.cpp HIP 실험용 �
 시간 제한은 없습니다. 작업이 몇 시간 걸려도 메모리 여유가 유지되면 계속합니다.
 고정 40GB RSS 상한 대신 시스템 가용 RAM·Windows commit 여유를 각각 4GiB,
 GPU 전체 사용량 기준 VRAM 여유를 1GiB 남기도록 시작 전·실행 중 감시합니다.
-시작 전에는 GGUF 파일 크기 + workspace 추정 1GiB + VRAM 여유 1GiB를 요구합니다.
+시작 전에는 GPU 적재 레이어에 해당하는 가중치의 보수적 추정 + workspace 추정 1GiB + VRAM 여유 1GiB를 요구합니다.
+부분 적재는 n_gpu_layers로 지정하며 나머지는 CPU·RAM에서 처리합니다. 실제 배치는 엔진 로그로 확인합니다.
 workspace는 KV/계산 버퍼의 정확한 필요량이 아니며, 순간 할당과 드라이버 장애까지 보장하지 않습니다.
 메모리 관측이 불가능하거나 여유가 부족하면 중단하고 원인을 기록합니다.
 이전 실행과 CONFIG가 달라졌다면 새 RUN_ID를 사용하세요. 실패한 작업은 자동 재시도하지 않습니다.
 엔진 GPU 할당 실패는 중단하며, CPU fallback으로 속도 결과를 조용히 대체하지 않습니다.
+원본 전용 측정은 RUN_MODEL과 RUN_EVALUATION/RUN_BENCHMARK만 켜고 RUN_PRUNING_ANALYSIS=False를 유지합니다.
+Expert 분석·절삭을 수행할 때만 RUN_PRUNING_ANALYSIS=True로 바꾸세요.
 """)
 code("""
 if INSTALL_DEPENDENCIES:
@@ -127,7 +132,7 @@ code("""
 from moe_prune.gguf import GGUF, sha256, validate_allowlist
 from moe_prune.research import (Experiment, read_jsonl, write_json, aggregate_routing, select_experts,
     routing_similarity, stability, compare_logits, ablation_sensitivity, summarize, benchmark,
-    render_tradeoff, canonical_hash, assert_disjoint, paired_quality)
+    render_tradeoff, canonical_hash, assert_disjoint, paired_quality, baseline_environment)
 exp = None
 inspection = None
 if RUN_MODEL:
@@ -189,7 +194,7 @@ md("""
 """)
 code("""
 profiles = None
-if RUN_MODEL and gate_records is not None:
+if RUN_MODEL and RUN_PRUNING_ANALYSIS and gate_records is not None:
     print(exp.compare('instrumentation', MODEL, MODEL, gate_records,
                       instrumentation_a=False, instrumentation_b=True))
     exp.require('instrumentation')
@@ -282,7 +287,7 @@ if RUN_MODEL and candidates:
 """)
 code("""
 noop = ROOT / 'runs' / RUN_ID / 'models/noop.gguf'
-if RUN_MODEL and WRITE_MODELS and gate_records is not None:
+if RUN_MODEL and RUN_PRUNING_ANALYSIS and WRITE_MODELS and gate_records is not None:
     exp.require('instrumentation', 'full-mask')
     if not noop.exists():
         write_json(exp.root / 'noop-export.json', original.rewrite(noop))
@@ -378,9 +383,10 @@ md("""
 """)
 code("""
 evaluations = {}
-if RUN_MODEL and RUN_EVALUATION and exports:
+if RUN_MODEL and RUN_EVALUATION and datasets is not None:
     evaluation_records = datasets['evaluation']
-    exp.record('evaluation_frozen', {'mask_sha256': canonical_hash({k: candidates[k] for k in exports}),
+    exp.record('evaluation_frozen', {'masks': {k: candidates[k] for k in exports},
+                                   'mask_sha256': canonical_hash({k: candidates[k] for k in exports}),
                                    'records_sha256': canonical_hash(evaluation_records), 'exploratory': True})
     for name, path in {'original': MODEL, **exports}.items():
         evaluations[name] = exp.collect('evaluation-' + name, path, evaluation_records, mode='generate', max_tokens=GENERATION_TOKENS)
@@ -393,13 +399,13 @@ if RUN_MODEL and RUN_EVALUATION and exports:
     paired = {name: paired_quality(evaluations['original'], rows, CONFIG['seed'])
               for name, rows in evaluations.items() if name != 'original'}
     write_json(exp.root / 'paired-quality.json', paired)
-    print(paired)
+    print(paired if paired else '비교 대상 없음: 원본 모델만 평가했습니다.')
 else:
     print('최종 평가 미실행. 코딩 정답률과 최종 품질 보존은 아직 미검증입니다.')
 """)
 code("""
 speed_results = {}
-if RUN_MODEL and RUN_BENCHMARK and exports:
+if RUN_MODEL and RUN_BENCHMARK and gate_records is not None:
     prompts = gate_records
     for name, path in {'original': MODEL, **exports}.items():
         speed_results[name] = benchmark(exp, 'speed-' + name, path, prompts, repetitions=5, max_tokens=256)
@@ -417,6 +423,27 @@ for name, rows in evaluations.items():
 display(HTML(render_tradeoff(points)))
 if exp is not None:
     write_json(exp.root / 'tradeoff-points.json', points)
+if exp is not None and (evaluations or speed_results):
+    # 2026-11-06: 로컬 실측의 조건·근거를 공개 성능 수치와 분리한다.
+    names = ['manifest.json', 'original-inspection.json', 'baseline-smoke.json',
+             'evaluation-original.json', 'evaluation-original-analysis.json',
+             'sanity-original.json', 'speed-original-benchmark.json']
+    baseline_summary = {
+        'environment': baseline_environment(),
+        'model': {'path': str(MODEL.resolve()), 'sha256': inspection['sha256'],
+                  'file_bytes': inspection['file_bytes']},
+        'dataset': {'manifest_sha256': sha256(DATA / 'manifest.json') if datasets is not None else None},
+        'config': CONFIG,
+        'sampling': {'strategy': 'greedy', 'temperature': 0, 'enable_thinking': False,
+                     'evaluation_max_tokens': GENERATION_TOKENS, 'benchmark_max_tokens': 256,
+                     'benchmark_repetitions': 5, 'smoke_max_tokens': 32},
+        'quality': summarize(evaluations['original']) if 'original' in evaluations else None,
+        'speed': speed_results.get('original'),
+        'limitations': '수학은 탐색용 숫자 정답 추정이며 MATH 기호식 수동 검토 필요; 생성 코드 실행 정답률 미측정. 공개 점수는 reference_only.',
+        'evidence': {name: str(exp.root / name) for name in names if (exp.root / name).is_file()},
+    }
+    write_json(exp.root / 'baseline-summary.json', baseline_summary)
+    print('원본 측정 요약:', baseline_summary)
 """)
 md("""
 ## 7. 결론
@@ -432,13 +459,14 @@ conclusion = {
     'H3': {'status': '근거 부족', 'review': 'physical 동등성·파일 크기·실측 VRAM을 각각 확인'},
     'H4': {'status': '근거 부족', 'review': '동일 조건 반복 속도와 실제 배치 확인; 미관측 전송을 0으로 해석하지 않음'},
     'scope': '실행한 단계만 해석, Router 제거 미실험',
-    'measurements_present': bool(evaluations),
+    'measurements_present': bool(evaluations or speed_results),
     'evidence': ({name: str(exp.root / name) for name in [
         'manifest.json', 'domain-distributions.json', 'selection-stability.json',
-        'exports.json', 'tradeoff-points.json']
+        'exports.json', 'tradeoff-points.json', 'evaluation-original-analysis.json',
+        'speed-original-benchmark.json', 'baseline-summary.json']
         if (exp.root / name).is_file()} if exp is not None else {}),
     'observed_file_sizes': ({name: path.stat().st_size for name, path in {'original': MODEL, **exports}.items()}
-                            if exports else {}),
+                            if inspection is not None else {}),
     'observed_speed_metrics': speed_results,
 }
 print(json.dumps(conclusion, ensure_ascii=False, indent=2))
@@ -452,5 +480,11 @@ notebook.metadata.kernelspec = {'display_name': 'wemakemodel (Python 3.12)', 'la
 notebook.metadata.language_info = {'name': 'python', 'version': '3.12'}
 nbf.validate(notebook)
 target = ROOT / 'ipynb/01_Gemma4_Expert_Pruning_연구.ipynb'
+if target.exists():
+    previous = nbf.read(target, as_version=4)
+    if len(previous.cells) != len(notebook.cells) or any(a.cell_type != b.cell_type for a, b in zip(previous.cells, notebook.cells)):
+        raise ValueError('기존 노트북 셀 구조가 달라 ID를 보존할 수 없습니다')
+    for old, new in zip(previous.cells, notebook.cells):
+        new.id = old.id
 nbf.write(notebook, target)
 print(target)

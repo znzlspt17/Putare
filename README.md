@@ -17,7 +17,7 @@ MoE(Mixture of Experts) 모델은 입력 토큰마다 Router가 여러 Expert �
 
 ## 시작하기
 
-주 실행 파일은 [Gemma 4 Expert Pruning 연구 노트북](ipynb/01_Gemma4_Expert_Pruning_연구.ipynb)입니다. 모델 준비에는 [모델 준비 노트북](ipynb/00_모델준비.ipynb)을 참고하세요.
+주 실행 파일은 [Gemma 4 Expert Pruning 연구 노트북](ipynb/01_Gemma4_Expert_Pruning_연구.ipynb)입니다. 대상 GGUF 모델 파일을 `models/`에 준비한 뒤 노트북을 엽니다.
 
 ### 준비할 것
 
@@ -27,22 +27,22 @@ MoE(Mixture of Experts) 모델은 입력 토큰마다 Router가 여러 Expert �
 - CMake·Ninja·C++ 빌드 도구·AMD HIP SDK를 갖춘 [native 엔진 빌드 환경](tools/native/README.md)
 - 원본과 별도로 생성할 GGUF 파일을 저장할 디스크 여유 공간
 
-PyTorch ROCm 패키지 설치와 HIP 컴파일러 준비는 별도입니다. 실제 GPU에 맞는 GPU target과 GPU offload 설정을 실행 전에 확인하세요. 노트북의 기본 설정은 컨텍스트 8K, 동시 요청 1개, 실험 프로세스 트리의 RAM 예산 40GB입니다. 이 예산은 시스템 전체 메모리 사용량을 보장하는 값이 아닙니다.
+PyTorch ROCm 패키지 설치와 HIP 컴파일러 준비는 별도입니다. 실행 전에 노트북의 `MODEL`, `GPU_TARGET`, `CONFIG`를 사용 환경에 맞게 확인하세요. 기본 컨텍스트는 16K이며, `n_gpu_layers=24`로 일부 레이어를 GPU에 적재합니다. 메모리 여유를 감시하지만, 모든 환경에서 실행을 보장하는 설정은 아닙니다.
 
 ### 실행 흐름
 
 1. 저장소 루트 또는 `ipynb/`를 작업 경로로 사용하여 연구 노트북을 엽니다.
 2. 모델 경로와 GPU 설정을 확인하고, 필요한 설치·엔진 빌드·데이터 다운로드 단계를 활성화합니다.
-3. `RUN_MODEL=True`로 원본 분석, 계측 전후 출력 비교, Expert 사용 통계 수집과 제거 민감도 분석을 실행합니다.
+3. `RUN_MODEL=True`, `RUN_PRUNING_ANALYSIS=True`로 원본 분석, 계측 전후 출력 비교, Expert 사용 통계 수집과 제거 민감도 분석을 실행합니다.
 4. `WRITE_MODELS=True`로 Expert를 제거하지 않은 재저장 파일과 첫 축소 모델(레이어별 Expert 120개 유지)을 검증합니다.
 5. 생성 결과와 참조 답변 손실을 검토한 뒤 다음 유지 개수를 결정합니다. 한 번에 하나의 유지 개수를 지정하며, 추가 축소에는 이전 단계 실측 요약의 검토 hash가 필요합니다.
 6. 유지할 집합을 고정한 뒤 `RUN_EVALUATION`과 `RUN_BENCHMARK`를 활성화해 품질과 속도를 비교합니다.
 
 **기본 설정에서 Run All은 모델 실행·네트워크 접근·빌드·축소 파일 생성을 수행하지 않습니다.** 각 단계는 사용자가 플래그를 켜서 실행합니다.
 
-## 결과를 읽을 때
+원본 모델의 품질과 속도만 측정하려면 `RUN_PRUNING_ANALYSIS=False`, `WRITE_MODELS=False`를 유지하고 `RUN_MODEL`과 필요한 `RUN_EVALUATION`·`RUN_BENCHMARK`를 켭니다. 설정을 바꿔 다시 실행할 때는 새 `RUN_ID`를 사용하세요.
 
-현재 제공하는 것은 실험 도구와 실행 절차입니다. 이 README는 실제 모델의 경량화 효과나 Windows HIP 빌드·추론 성공을 검증한 결과를 제시하지 않습니다.
+## 결과를 읽을 때
 
 | 결과 | 해석 범위 |
 |---|---|
@@ -54,19 +54,5 @@ PyTorch ROCm 패키지 설치와 HIP 컴파일러 준비는 별도입니다. 실
 
 노트북의 Unsloth 공개 모델 점수는 참고 자료이며, 대상 GGUF 파일을 로컬에서 측정한 값과 구분합니다.
 
-## 구성과 검증
 
-| 경로 | 내용 |
-|---|---|
-| `ipynb/` | 모델 준비와 Expert Pruning 실험 노트북 |
-| `moe_prune/` | 데이터 처리, Expert 분석과 GGUF 축소 모듈 |
-| `tools/native/` | llama.cpp 기반 실험 엔진과 빌드 안내 |
-| `tests/` | 합성 GGUF·가짜 Routing 통계를 사용하는 검증 |
-| `runs/` | 실행 시 생성되는 실험 기록과 결과 |
-
-실제 모델을 로딩하지 않는 보조 도구 테스트는 다음과 같이 실행합니다.
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m unittest discover -s tools/native -p "test_*.py" -v
-```
+실행 결과는 `runs/<RUN_ID>/`에 저장됩니다. 생성 결과와 평가 요약, 파일 크기, 속도 기록을 같은 실행 조건끼리 비교하세요.

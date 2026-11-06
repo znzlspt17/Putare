@@ -69,6 +69,7 @@ class NotebookFlowTests(unittest.TestCase):
             })
             namespace = {"__name__": "__notebook_synthetic_test__"}
             with patch("moe_prune.research.source_revision", return_value={"git_commit": "synthetic", "git_dirty": False}), \
+                 patch("moe_prune.research.baseline_environment", return_value={"gpu": None, "ram_bytes": None}), \
                  patch("moe_prune.research.subprocess.Popen", side_effect=SyntheticNative), \
                  patch("moe_prune.memory_safety._available_memory", return_value=(64 * 1024**3, 64 * 1024**3)), \
                  patch("moe_prune.memory_safety.AdapterMemory") as adapter, \
@@ -83,7 +84,7 @@ class NotebookFlowTests(unittest.TestCase):
                         if "INSTALL_DEPENDENCIES = False" in cell.source:
                             configured = True
                             namespace.update(ROOT=root, MODEL=model, ENGINE=engine, DATA=data,
-                                             RUN_MODEL=True, WRITE_MODELS=True, RUN_EVALUATION=True, RUN_BENCHMARK=True,
+                                             RUN_MODEL=True, RUN_PRUNING_ANALYSIS=True, WRITE_MODELS=True, RUN_EVALUATION=True, RUN_BENCHMARK=True,
                                              APPROVED_KEEP_COUNTS=[keep])
                             namespace["CONFIG"]["engine"] = str(engine)
                             if previous:

@@ -16,11 +16,13 @@ def fixture(path, extra=None, experts=4, top_k=2):
     # 2026-11-05: 역양자화 없이 Expert별 서로 다른 블록을 복사하는지 검증한다.
     metadata = [
         ("general.architecture", 8, string("gemma4")),
+        ("gemma4.block_count", 4, struct.pack("<I", 1)),
         ("gemma4.expert_count", 4, struct.pack("<I", experts)),
         ("gemma4.expert_used_count", 4, struct.pack("<I", top_k)),
         ("tokenizer.chat_template", 8, string("그대로 보존")),
     ]
     tensors = [
+        ("token_embd.weight", (32,), 0, bytes(128)),
         ("blk.0.ffn_gate_inp.weight", (32, experts), 20, b"".join(bytes([i + 1]) * 18 for i in range(experts))),
         ("blk.0.ffn_gate_inp.scale", (32,), 0, struct.pack("<32f", *range(32))),
         ("blk.0.ffn_gate_up_exps.weight", (32, 64, experts), 20, b"".join(bytes([i + 10]) * (18 * 64) for i in range(experts))),

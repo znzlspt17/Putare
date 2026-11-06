@@ -27,7 +27,8 @@ def prepare_datasets(destination, calibration=64, selection=64, evaluation_limit
     resolved = {name: _revision(repo) for name, (repo, _) in repos.items()}
     def load(name, split):
         repo, subset = repos[name]
-        return load_dataset(repo, subset, split=split, revision=resolved[name][0])
+        # 2026-11-06: 공개 데이터만 쓰며 로컬 인증 정보를 암묵적으로 읽지 않는다.
+        return load_dataset(repo, subset, split=split, revision=resolved[name][0], token=False)
     groups = {"calibration": [], "selection": [], "evaluation": []}
     for name, domain, prompt_key, ref_key in (("gsm8k", "math", "question", "answer"), ("mbpp", "code", "text", "code")):
         records = [{"id": f"{name}:train:{r.get('task_id', i)}", "domain": domain, "dataset": name,

@@ -6,6 +6,7 @@ from collections import defaultdict
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -19,6 +20,34 @@ import importlib.metadata
 
 from .gguf import GGUF, sha256, validate_allowlist
 from .memory_safety import MemoryGuard
+
+
+_NATIVE_ENV_ALLOWLIST = (
+    'SystemRoot', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA',
+    'ProgramData', 'ProgramFiles', 'ProgramFiles(x86)', 'PATH', 'PATHEXT', 'NUMBER_OF_PROCESSORS',
+    'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL', 'ROCM_PATH', 'HIP_PATH',
+    'HIP_DEVICE_LIB_PATH', 'HIP_LAUNCH_BLOCKING', 'AMD_SERIALIZE_KERNEL', 'HSA_ENABLE_SDMA',
+    'HSA_OVERRIDE_GFX_VERSION', 'ROCBLAS_LAYER', 'ROCBLAS_TENSILE_LIBPATH',
+    'GGML_CUDA_NO_PINNED', 'GGML_CUDA_ENABLE_UNIFIED_MEMORY', 'GGML_CUDA_DISABLE_GRAPHS',
+)
+
+
+def native_runtime_directories(prefix=None):
+    """2026-11-06: pip ROCm SDK의 DLL 경로를 현재 Python 환경에서만 찾는다."""
+    site = Path(prefix or sys.prefix) / 'Lib/site-packages'
+    paths = [site / '_rocm_sdk_devel/bin', site / '_rocm_sdk_devel/lib/llvm/bin',
+             site / '_rocm_sdk_core/bin', site / '_rocm_sdk_libraries_custom/bin']
+    return [str(path) for path in paths if path.is_dir()]
+
+
+def spawn_native(command, **kwargs):
+    """허용된 OS/HIP 변수만 자식에 전달해 부모 환경 변경과 비밀 복사를 피한다."""
+    paths = native_runtime_directories()
+    environment = {name: value for name in _NATIVE_ENV_ALLOWLIST if (value := os.environ.get(name)) is not None}
+    original = environment.get('PATH')
+    if paths:
+        environment['PATH'] = os.pathsep.join(paths + ([original] if original else []))
+    return subprocess.Popen(command, env=environment, **kwargs)
 
 
 def canonical_hash(value):
@@ -173,6 +202,39 @@ def source_revision():
     return {"git_commit": git("rev-parse", "HEAD"), "git_dirty": bool(git("status", "--porcelain"))}
 
 
+def baseline_environment():
+    """2026-11-06: 공개 하드웨어 정보 실패를 실측 GPU 확인으로 오인하지 않는다."""
+    import psutil
+    gpu = None
+    cpu_name = None
+    if platform.system() == 'Windows':
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as key:
+                cpu_name = winreg.QueryValueEx(key, 'ProcessorNameString')[0].strip()
+        except (OSError, ImportError):
+            pass
+        command = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+                   "Get-CimInstance Win32_VideoController | "
+                   "Select-Object Name,DriverVersion | ConvertTo-Json -Compress")
+        try:
+            result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+                                    check=True, capture_output=True, text=True, encoding='utf-8', timeout=10)
+            rows = json.loads(result.stdout)
+            rows = rows if isinstance(rows, list) else [rows]
+            gpu = [{'name': row.get('Name'), 'driver_version': row.get('DriverVersion')} for row in rows]
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
+            pass
+    try:
+        ram = psutil.virtual_memory().total
+    except (OSError, RuntimeError):
+        ram = None
+    return {'platform': platform.platform(), 'processor': platform.processor(), 'ram_bytes': ram, 'gpu': gpu,
+            'cpu': {'name': cpu_name, 'physical_cores': psutil.cpu_count(logical=False),
+                    'logical_cores': psutil.cpu_count(logical=True)}}
+
+
 class Experiment:
     """실제 모델 작업은 명시적인 사용자 셀 호출에서만 실행한다."""
     def __init__(self, root, config):
@@ -262,7 +324,7 @@ class Experiment:
         write_json(self.root / "manifest.json", self.manifest)
         started, peak, failure = time.perf_counter(), None, None
         with (folder / "stdout.log").open("wb") as out, (folder / "stderr.log").open("wb") as err:
-            process = subprocess.Popen([str(executable.resolve()), "--request", str((folder / "request.json").resolve()), "--output", str((folder / "events.jsonl").resolve())], stdout=out, stderr=err)
+            process = spawn_native([str(executable.resolve()), "--request", str((folder / "request.json").resolve()), "--output", str((folder / "events.jsonl").resolve())], stdout=out, stderr=err)
             monitor, gpu_sampler = None, None
             try:
                 gpu_sampler = ProcessGpuMemorySampler(process.pid)

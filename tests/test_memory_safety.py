@@ -11,6 +11,7 @@ from unittest.mock import patch
 import psutil
 from moe_prune.research import Experiment
 from moe_prune.memory_safety import AdapterMemory, GIB, MemoryGuard
+from test_gguf_integration import fixture
 
 
 class RunningEngine:
@@ -181,7 +182,7 @@ class MemorySafetyTests(unittest.TestCase):
     def test_preflight_reserves_full_model_workspace_and_gpu_headroom(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory) / 'model'
-            model.write_bytes(b'12345')
+            fixture(model)
             request = {'model': str(model), 'n_gpu_layers': 99}
             with patch('moe_prune.memory_safety._available_memory', return_value=(8 * GIB, 8 * GIB)), \
                  patch('moe_prune.memory_safety.AdapterMemory') as adapter:
