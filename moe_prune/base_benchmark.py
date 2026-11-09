@@ -12,27 +12,20 @@ import shutil
 
 from .gguf import GGUF, sha256
 from .research import Experiment, canonical_hash, read_jsonl, write_json, write_jsonl
+from .resident import ResidentExperiment, SessionCleanupError
 
 
 DEFAULT_CONFIG = {'seed': 42, 'context_size': 65535, 'max_tokens': 32768,
-                  'n_gpu_layers': 24, 'ram_budget_bytes': None,
-                  'min_available_ram_bytes': 4 * 1024**3,
-                  'min_available_commit_bytes': 4 * 1024**3,
-                  'min_free_vram_bytes': 1024**3, 'vram_workspace_bytes': 1024**3,
-                  'max_vram_usage_fraction': .97}
-PLACEMENTS = tuple((layers, cache) for layers in (24, 20, 16, 12, 8, 4, 0)
-                   for cache in ((True, False) if layers else (False,)))
+                  'n_gpu_layers': 31, 'ram_usage_warn_fraction': .80,
+                  'vram_usage_warn_fraction': .97}
+PLACEMENTS = ((31, True),)
 
 
 def run_with_offload(invoke, start=0):
-    """2026-11-06: 명확한 메모리 실패만 다음 배치로 넘긴다."""
-    failures = []
-    for position in range(start, len(PLACEMENTS)):
-        try:
-            return invoke(PLACEMENTS[position]), position
-        except MemoryError as error:
-            failures.append(str(error))
-    raise MemoryError(f'모든 호환 배치의 메모리 부족: {failures}')
+    """2026-11-09: Colab 비교 실험은 전체 GPU 배치를 유지하고 실패를 전파한다."""
+    if start != 0:
+        raise ValueError('전체 GPU 배치만 지원합니다')
+    return invoke(PLACEMENTS[0]), 0
 
 
 def load_completed(path, record_id, identity_hash, run_dir):
@@ -188,7 +181,7 @@ class BenchmarkRun:
         """2026-11-06: 완료된 문제만 재사용하며 미완료는 점수에 포함하지 않는다."""
         records_path = self.snapshot / 'records.jsonl'
         manifest_path = self.snapshot / 'manifest.json'
-        from .benchmark_data import load_snapshot, validate_id_proof
+        from .benchmark_data import grader_identity, load_snapshot, validate_id_proof
         records, manifest = load_snapshot(self.snapshot)
         if len({r['id'] for r in records}) != len(records):
             raise ValueError('중복 문제 ID')
@@ -202,15 +195,26 @@ class BenchmarkRun:
                 proof = validate_id_proof(self.snapshot)
             except FileNotFoundError as error:
                 raise FileNotFoundError(f'{error} — 노트북의 v5 원본 ID 검증 준비 셀을 먼저 실행하세요') from error
+            # 2026-11-09: snapshot의 공식 formatter는 유지하면서 새 실행기의 identity는 별도로 결속한다.
+            root = Path(__file__).resolve().parents[1]
+            current_grader = grader_identity(root)
+            if manifest.get('grader_identity', {}).get('tools/lcb_grade.py') != current_grader['tools/lcb_grade.py']:
+                raise ValueError('공식 채점 어댑터가 snapshot과 다릅니다')
         original = GGUF(self.model)
         layers, experts, top_k = original.architecture()
         if layers != list(range(30)) or experts != 128 or top_k != 8:
             raise ValueError('예상 Gemma4 Expert 구조와 다릅니다')
         self.run_dir.mkdir(parents=True, exist_ok=True)
         identity = {'config': self.config, 'scope': 'smoke' if smoke else 'benchmark',
+                    'execution_mode': 'resident-v1', 'context_reset': 'kv-sampler-observer-v1',
                     'model': sha256(self.model), 'engine': sha256(self.engine),
                     'snapshot_manifest': sha256(manifest_path), 'snapshot_records': sha256(records_path)}
         if not smoke:
+            from .benchmark_data import official_identity
+            current_official = official_identity(root)
+            if current_official.get('source_digest') != manifest.get('official_identity', {}).get('source_digest'):
+                raise ValueError('공식 채점기 source가 snapshot과 다릅니다')
+            identity.update({'official_identity': current_official, 'grader_identity': current_grader})
             identity['lcb_v5_id_proof'] = canonical_hash(proof)
         identity_hash = canonical_hash(identity)
         identity_path = self.run_dir / 'benchmark-identity.json'
@@ -220,86 +224,90 @@ class BenchmarkRun:
         else:
             write_json(identity_path, identity)
         exp_config = {**self.config, 'engine': str(self.engine.resolve()), 'benchmark_identity': identity_hash}
-        exp = Experiment(self.run_dir, exp_config)
         answers = []
         placement_index = 0
         generation_path = self.run_dir / 'generations.jsonl'
-        for record in records:
-            key = hashlib.sha256(record['id'].encode('utf-8')).hexdigest()
-            answer_path = self.run_dir / 'answers' / f'{key}.json'
-            if answer_path.exists():
-                answer = load_completed(answer_path, record['id'], identity_hash, self.run_dir)
-                answers.append(answer)
-                placement_index = PLACEMENTS.index(tuple(answer['placement']))
-                continue
-            def invoke(placement):
-                # 2026-11-06: 실패 시도 폴더는 보존해 재시도가 이전 결과를 덮지 않도록 한다.
-                placement_key = f'{placement[0]}-{int(placement[1])}'
-                base = f'base-{key[:20]}-{placement_key}'
-                number = 0
-                while (self.run_dir / 'jobs' / f'{base}-{number}').exists():
-                    existing = self.run_dir / 'jobs' / f'{base}-{number}'
-                    if (existing / 'measurement.json').is_file() and (existing / 'events.jsonl').is_file():
-                        break
-                    number += 1
-                name = f'{base}-{number}'
-                folder = self.run_dir / 'jobs' / name
-                request = build_request(record, self.model, placement, self.config)
+        with ResidentExperiment(self.run_dir, exp_config) as exp:
+            for record in records:
+                key = hashlib.sha256(record['id'].encode('utf-8')).hexdigest()
+                answer_path = self.run_dir / 'answers' / f'{key}.json'
+                if answer_path.exists():
+                    answer = load_completed(answer_path, record['id'], identity_hash, self.run_dir)
+                    answers.append(answer)
+                    placement_index = PLACEMENTS.index(tuple(answer['placement']))
+                    continue
+                def invoke(placement):
+                    # 2026-11-06: 실패 시도 폴더는 보존해 재시도가 이전 결과를 덮지 않도록 한다.
+                    placement_key = f'{placement[0]}-{int(placement[1])}'
+                    base = f'base-{key[:20]}-{placement_key}'
+                    number = 0
+                    while (self.run_dir / 'jobs' / f'{base}-{number}').exists():
+                        existing = self.run_dir / 'jobs' / f'{base}-{number}'
+                        if (existing / 'measurement.json').is_file() and (existing / 'events.jsonl').is_file():
+                            break
+                        number += 1
+                    name = f'{base}-{number}'
+                    folder = self.run_dir / 'jobs' / name
+                    request = build_request(record, self.model, placement, self.config)
+                    try:
+                        result = exp.run(name, request)
+                    except SessionCleanupError:
+                        raise
+                    except RuntimeError as error:
+                        stderr = folder / 'stderr-failure.log'
+                        if stderr.is_file():
+                            text = stderr.read_text(encoding='utf-8', errors='replace').lower()
+                            if re.search(r'out of memory|hiperroroutofmemory|cannot allocate memory|failed to allocate|allocation failed', text):
+                                raise MemoryError(f'native GPU/host allocation failed: {folder}') from error
+                        raise
+                    return folder, result, placement, request
                 try:
-                    result = exp.run(name, request)
-                except RuntimeError as error:
-                    stderr = folder / 'stderr.log'
-                    if stderr.is_file():
-                        text = stderr.read_text(encoding='utf-8', errors='replace').lower()
-                        if re.search(r'out of memory|hiperroroutofmemory|cannot allocate memory|failed to allocate|allocation failed', text):
-                            raise MemoryError(f'native GPU/host allocation failed: {folder}') from error
+                    (folder, result, placement, request), placement_index = run_with_offload(invoke, placement_index)
+                    if (result.get('cache_type_k'), result.get('cache_type_v')) != ('q8_0', 'q8_0'):
+                        raise ValueError('native KV cache 형식 불일치')
+                    if not result.get('instrumentation') or not result.get('flash_attention_requested'):
+                        raise ValueError('계측 또는 Flash Attention 요청 누락')
+                    if result.get('offload_kqv_requested') != placement[1]:
+                        raise ValueError('KV 배치 요청 불일치')
+                    if result.get('sampling', {}).get('strategy') != 'sampled':
+                        raise ValueError('요청한 샘플링이 적용되지 않았습니다')
+                    observed = verify_runtime(result, (folder / 'stderr.log').read_text(encoding='utf-8', errors='replace'), request)
+                    observed['evidence_log'] = str((folder / 'stderr.log').relative_to(self.run_dir))
+                    events_path = folder / 'events.jsonl'
+                    count = validate_routing(read_jsonl(events_path), result)
+                    if result.get('routing_records') != count:
+                        raise ValueError('native 계측 총수와 검증 개수 불일치')
+                    target = self.run_dir / 'routing' / f'{key}.jsonl.gz'
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_suffix('.gz.tmp')
+                    digest = hashlib.sha256()
+                    with events_path.open('rb') as source, gzip.open(temporary, 'wb', compresslevel=3) as output:
+                        while chunk := source.read(1024 * 1024):
+                            digest.update(chunk)
+                            output.write(chunk)
+                    verified = hashlib.sha256()
+                    with gzip.open(temporary, 'rb') as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            verified.update(chunk)
+                    if digest.digest() != verified.digest():
+                        raise ValueError('계측 압축 검증 실패')
+                    exp.check()
+                    temporary.replace(target)
+                    answer = {'id': record['id'], 'domain': record['domain'], 'dataset': record['dataset'],
+                              **result, 'observed_runtime': observed, 'placement': list(placement), 'identity_hash': identity_hash,
+                              'routing_path': str(target.relative_to(self.run_dir)), 'routing_sha256': sha256(target)}
+                    answer['answer_sha256'] = canonical_hash(answer)
+                    write_json(answer_path, answer)
+                    # 압축 내용을 검증하고 답안이 커밋된 다음에만 작업용 원본을 제거한다.
+                    events_path.unlink()
+                    answers.append(answer)
+                    write_jsonl(generation_path, answers)
+                    print(f"{len(answers)}/{len(records)} {record['id']} 완료 배치={placement} "
+                          f"상주 세션 실행 중 메모리={result.get('measurement', {}).get('memory_last')}", flush=True)
+                except BaseException:
+                    write_jsonl(generation_path, answers)
+                    write_json(self.run_dir / 'benchmark-status.json', {'complete': False, 'completed': len(answers), 'total': len(records)})
                     raise
-                return folder, result, placement, request
-            try:
-                (folder, result, placement, request), placement_index = run_with_offload(invoke, placement_index)
-                if (result.get('cache_type_k'), result.get('cache_type_v')) != ('q8_0', 'q8_0'):
-                    raise ValueError('native KV cache 형식 불일치')
-                if not result.get('instrumentation') or not result.get('flash_attention_requested'):
-                    raise ValueError('계측 또는 Flash Attention 요청 누락')
-                if result.get('offload_kqv_requested') != placement[1]:
-                    raise ValueError('KV 배치 요청 불일치')
-                if result.get('sampling', {}).get('strategy') != 'sampled':
-                    raise ValueError('요청한 샘플링이 적용되지 않았습니다')
-                observed = verify_runtime(result, (folder / 'stderr.log').read_text(encoding='utf-8', errors='replace'), request)
-                observed['evidence_log'] = str((folder / 'stderr.log').relative_to(self.run_dir))
-                events_path = folder / 'events.jsonl'
-                count = validate_routing(read_jsonl(events_path), result)
-                if result.get('routing_records') != count:
-                    raise ValueError('native 계측 총수와 검증 개수 불일치')
-                target = self.run_dir / 'routing' / f'{key}.jsonl.gz'
-                target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_suffix('.gz.tmp')
-                digest = hashlib.sha256()
-                with events_path.open('rb') as source, gzip.open(temporary, 'wb', compresslevel=3) as output:
-                    while chunk := source.read(1024 * 1024):
-                        digest.update(chunk)
-                        output.write(chunk)
-                verified = hashlib.sha256()
-                with gzip.open(temporary, 'rb') as stream:
-                    while chunk := stream.read(1024 * 1024):
-                        verified.update(chunk)
-                if digest.digest() != verified.digest():
-                    raise ValueError('계측 압축 검증 실패')
-                temporary.replace(target)
-                answer = {'id': record['id'], 'domain': record['domain'], 'dataset': record['dataset'],
-                          **result, 'observed_runtime': observed, 'placement': list(placement), 'identity_hash': identity_hash,
-                          'routing_path': str(target.relative_to(self.run_dir)), 'routing_sha256': sha256(target)}
-                answer['answer_sha256'] = canonical_hash(answer)
-                write_json(answer_path, answer)
-                # 압축 내용을 검증하고 답안이 커밋된 다음에만 작업용 원본을 제거한다.
-                events_path.unlink()
-                answers.append(answer)
-                write_jsonl(generation_path, answers)
-                print(f"{len(answers)}/{len(records)} {record['id']} 완료", flush=True)
-            except BaseException:
-                write_jsonl(generation_path, answers)
-                write_json(self.run_dir / 'benchmark-status.json', {'complete': False, 'completed': len(answers), 'total': len(records)})
-                raise
         write_jsonl(generation_path, answers)
         samples = ((row['domain'], _read_compressed(self.run_dir / row['routing_path'])) for row in answers)
         profiles = aggregate_profiles(samples)

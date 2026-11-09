@@ -45,7 +45,7 @@ def scan_stream(stream, chunk_size=1024 * 1024):
 def _open(url):
     # 인증 저장소와 프록시 인증값을 참조하지 않는 공개 HTTPS 요청이다.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    return opener.open(urllib.request.Request(url, headers={'User-Agent': 'wemakemodel-benchmark/1'}), timeout=120)
+    return opener.open(urllib.request.Request(url, headers={'User-Agent': 'putare-benchmark/1'}), timeout=120)
 
 
 def verify(snapshot, output):

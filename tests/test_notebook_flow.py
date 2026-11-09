@@ -44,16 +44,31 @@ class SyntheticNative:
 
 
 class NotebookFlowTests(unittest.TestCase):
+    def setUp(self):
+        # 합성 엔진의 잠금 경계는 별도로 검증한다.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for field in ('_LOCK', '_POISON'):
+            isolated = patch('moe_prune.execution_safety.' + field, Path(temp.name) / field)
+            isolated.start()
+            self.addCleanup(isolated.stop)
+        patcher = patch('moe_prune.execution_safety.execution_guard', side_effect=lambda *args, **kwargs: contextlib.nullcontext())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        poison = patch('moe_prune.execution_safety.poison_execution')
+        poison.start()
+        self.addCleanup(poison.stop)
+
     def test_all_seven_sections_with_synthetic_inputs(self):
         repository = Path(__file__).resolve().parents[1]
-        notebook = nbformat.read(repository / "ipynb/01_Gemma4_Expert_Pruning_연구.ipynb", as_version=4)
+        notebook = nbformat.read(repository / "ipynb/01_base_model_분석.ipynb", as_version=4)
         headings = [c.source.splitlines()[0] for c in notebook.cells if c.cell_type == "markdown" and c.source.startswith("## ")]
         self.assertEqual(len(headings), 7)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             model = root / "original.gguf"
             fixture(model, experts=128, top_k=8)
-            engine = root / "synthetic.exe"
+            engine = root / "synthetic-engine"
             engine.write_bytes(b"not executable; Popen is replaced by a test double")
             data = root / "data"
             groups = {}
@@ -68,10 +83,12 @@ class NotebookFlowTests(unittest.TestCase):
                 "full_record_hashes": {key: canonical_hash(value) for key, value in groups.items()},
             })
             namespace = {"__name__": "__notebook_synthetic_test__"}
-            with patch("moe_prune.research.source_revision", return_value={"git_commit": "synthetic", "git_dirty": False}), \
+            with patch("platform.platform", return_value="Linux synthetic"), \
+                 patch("platform.processor", return_value="synthetic CPU"), \
+                 patch("moe_prune.research.source_revision", return_value={"git_commit": "synthetic", "git_dirty": False}), \
                  patch("moe_prune.research.baseline_environment", return_value={"gpu": None, "ram_bytes": None}), \
                  patch("moe_prune.research.subprocess.Popen", side_effect=SyntheticNative), \
-                 patch("moe_prune.memory_safety._available_memory", return_value=(64 * 1024**3, 64 * 1024**3)), \
+                 patch("moe_prune.memory_safety._ram_sample", return_value=(128 * 1024**3, 64 * 1024**3, "synthetic")), \
                  patch("moe_prune.memory_safety.AdapterMemory") as adapter, \
                  patch("psutil.Process"), contextlib.redirect_stdout(io.StringIO()):
                 adapter.return_value.sample.return_value = (16 * 1024**3, 0)

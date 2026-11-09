@@ -8,7 +8,7 @@ from moe_prune.research import spawn_native
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = ROOT / '.cache/llama-build/bin/llama-expert-research.exe'
+ENGINE = ROOT / '.cache/llama-build/bin/llama-expert-research'
 
 
 @unittest.skipUnless(ENGINE.exists(), 'native engine not built')

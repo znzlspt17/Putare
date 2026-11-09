@@ -1,4 +1,4 @@
-"""실제 GGUF/HIP 계측 경계 회귀. 명시적으로 실행할 때만 모델을 로드한다."""
+"""실제 GGUF/CUDA 계측 경계 회귀. 명시적으로 실행할 때만 모델을 로드한다."""
 import os
 import tempfile
 import unittest
@@ -10,15 +10,13 @@ from moe_prune.research import Experiment
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@unittest.skipUnless(os.environ.get("RUN_NATIVE_INSTRUMENTATION_TESTS") == "1", "실제 모델/HIP 검증은 명시 실행")
+@unittest.skipUnless(os.environ.get("RUN_NATIVE_INSTRUMENTATION_TESTS") == "1", "실제 모델/CUDA 검증은 명시 실행")
 class NativeInstrumentationIntegrationTests(unittest.TestCase):
     def test_instrumented_logits_and_decode_match_original(self):
         model = ROOT / "models/gemma-4-26B-A4B-it-UD-IQ4_NL.gguf"
-        config = {"seed": 42, "context_size": 16384, "n_gpu_layers": 24,
-                  "ram_budget_bytes": None, "min_available_ram_bytes": 4 * 1024**3,
-                  "min_available_commit_bytes": 4 * 1024**3, "min_free_vram_bytes": 1024**3,
-                  "vram_workspace_bytes": 1024**3,
-                  "engine": str(ROOT / ".cache/llama-build/bin/llama-expert-research.exe")}
+        config = {"seed": 42, "context_size": 16384, "n_gpu_layers": 31,
+                  "ram_usage_warn_fraction": .80, "vram_usage_warn_fraction": .97,
+                  "engine": str(ROOT / ".cache/llama-build/bin/llama-expert-research")}
         groups, _ = load_snapshot(ROOT / "runs/datasets/snapshot-001")
         record = next(r for r in groups["selection"] if r["domain"] == "math")
         with tempfile.TemporaryDirectory() as temp:

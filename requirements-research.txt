@@ -1,6 +1,7 @@
-# 기존 ROCm/PyTorch lock을 변경하지 않는 선택 설치 목록.
+# Colab의 기존 PyTorch를 교체하지 않는 실험 도구 목록.
 numpy>=2.0,<3
 psutil>=7,<8
 nbformat>=5.10,<6
 datasets>=4.0,<5
 evalplus==0.3.1
+nvidia-ml-py>=12,<14

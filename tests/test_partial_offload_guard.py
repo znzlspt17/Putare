@@ -47,7 +47,7 @@ class PartialOffloadGuardTests(unittest.TestCase):
             non_block_payload = 512 + 64 + 64
             free = 2 * GIB + selected_payload + non_block_payload + 1024
             self.assertLess(free, 2 * GIB + model.stat().st_size)
-            with patch('moe_prune.memory_safety._available_memory', return_value=(8 * GIB, 8 * GIB)), \
+            with patch('moe_prune.memory_safety._ram_sample', return_value=(16 * GIB, 8 * GIB, 'fixture')), \
                  patch('moe_prune.memory_safety.AdapterMemory') as adapter:
                 adapter.return_value.sample.return_value = (4 * GIB, 4 * GIB - free)
                 guard = MemoryGuard({}, {'model': str(model), 'n_gpu_layers': 2})
@@ -57,13 +57,13 @@ class PartialOffloadGuardTests(unittest.TestCase):
                     guard.close()
             self.assertGreaterEqual(observed['vram_estimated_model_bytes'], selected_payload + non_block_payload)
             self.assertLess(observed['vram_estimated_model_bytes'], model.stat().st_size)
-            self.assertEqual(observed['vram_preflight_required_bytes'], observed['vram_estimated_model_bytes'] + 2 * GIB)
+            self.assertNotIn('vram_preflight_required_bytes', observed)
 
     def test_partial_offload_rejects_invalid_gguf(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory) / 'invalid.gguf'
             model.write_bytes(b'not GGUF')
-            with patch('moe_prune.memory_safety._available_memory', return_value=(8 * GIB, 8 * GIB)), \
+            with patch('moe_prune.memory_safety._ram_sample', return_value=(16 * GIB, 8 * GIB, 'fixture')), \
                  patch('moe_prune.memory_safety.AdapterMemory') as adapter:
                 adapter.return_value.sample.return_value = (8 * GIB, 0)
                 guard = MemoryGuard({}, {'model': str(model), 'n_gpu_layers': 2})
@@ -73,19 +73,19 @@ class PartialOffloadGuardTests(unittest.TestCase):
                 finally:
                     guard.close()
 
-    def test_partial_offload_stops_if_selected_weights_and_headroom_do_not_fit(self):
+    def test_partial_offload_warns_if_estimated_weights_exceed_threshold(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory) / 'model.gguf'
             _fixture(model)
             # token embedding도 output으로 GPU에 놓일 수 있으므로 전역 tensor를 포함한다.
-            free = 2 * GIB + 8192 + 64 + 512 + 64 + 64 - 1
-            with patch('moe_prune.memory_safety._available_memory', return_value=(8 * GIB, 8 * GIB)), \
+            free = 128
+            with patch('moe_prune.memory_safety._ram_sample', return_value=(16 * GIB, 8 * GIB, 'fixture')), \
                  patch('moe_prune.memory_safety.AdapterMemory') as adapter:
                 adapter.return_value.sample.return_value = (4 * GIB, 4 * GIB - free)
                 guard = MemoryGuard({}, {'model': str(model), 'n_gpu_layers': 2})
                 try:
-                    with self.assertRaisesRegex(MemoryError, 'GPU reserve'):
-                        guard.preflight()
+                    observed=guard.preflight()
+                    self.assertTrue(any(x['kind']=='predicted' and x['resource']=='vram' for x in observed['warning_events']))
                 finally:
                     guard.close()
 

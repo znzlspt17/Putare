@@ -1,4 +1,4 @@
-"""실제 WSL 공식 채점기를 격리 경로로만 실행하는 선택 통합 검사."""
+"""실제 Colab 공식 채점기를 비격리 실행하는 선택 통합 검사."""
 import json
 import os
 from pathlib import Path
@@ -6,12 +6,13 @@ import subprocess
 import tempfile
 import unittest
 
-from moe_prune.benchmark_data import WSL_DISTRO, WSL_SOURCE, WSL_VENV, windows_to_wsl_path, load_snapshot
+from moe_prune.benchmark_data import grader_paths, load_snapshot
+from moe_prune.grading import run
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@unittest.skipUnless(os.environ.get('RUN_WSL_LCB_TESTS') == '1', 'WSL 공식 채점기는 명시 실행')
+@unittest.skipUnless(os.environ.get('RUN_COLAB_LCB_TESTS') == '1', 'Colab 공식 채점기는 명시 실행')
 class OfficialGraderTests(unittest.TestCase):
     def test_correct_wrong_and_timeout(self):
         tests = json.dumps([{'input': '3\n', 'output': '6\n', 'testtype': 'stdin'}])
@@ -23,10 +24,8 @@ class OfficialGraderTests(unittest.TestCase):
                 input_file, output_file = folder / f'in{i}.json', folder / f'out{i}.json'
                 input_file.write_text(json.dumps({'id': str(i), 'problem': problem,
                                                   'text': f'```python\n{code}\n```'}), encoding='utf-8')
-                command = ['wsl.exe', '--distribution', WSL_DISTRO, '--exec', 'bash',
-                           windows_to_wsl_path(ROOT / 'tools/lcb_sandbox.sh'), WSL_SOURCE, WSL_VENV,
-                           windows_to_wsl_path(input_file), windows_to_wsl_path(output_file)]
-                subprocess.run(command, check=True)
+                venv, source = grader_paths(ROOT)
+                run(source, venv, input_file, output_file)
                 result = json.loads(output_file.read_text(encoding='utf-8'))
                 self.assertIn('passed', result, result)
                 self.assertEqual(result['passed'], expected)
@@ -45,9 +44,8 @@ class OfficialGraderTests(unittest.TestCase):
             input_file, output_file = folder / 'input.json', folder / 'output.json'
             input_file.write_text(json.dumps({'id': record['id'], 'problem': record['lcb_problem'],
                                               'text': '```python\nraise RuntimeError()\n```'}), encoding='utf-8')
-            subprocess.run(['wsl.exe', '--distribution', WSL_DISTRO, '--exec', 'bash',
-                            windows_to_wsl_path(ROOT / 'tools/lcb_sandbox.sh'), WSL_SOURCE, WSL_VENV,
-                            windows_to_wsl_path(input_file), windows_to_wsl_path(output_file)], check=True)
+            venv, source = grader_paths(ROOT)
+            run(source, venv, input_file, output_file)
             result = json.loads(output_file.read_text(encoding='utf-8'))
             self.assertIn('passed', result, result)
             self.assertFalse(result['passed'])

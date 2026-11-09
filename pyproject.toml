@@ -1,28 +1,15 @@
 [project]
-name = "wemakemodel"
+name = "putare"
 version = "0.1.0"
-description = "Add your description here"
+description = "Gemma 4 expert pruning research"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "jupyter>=1.1.1",
-    "torch==2.9.1+rocm7.2.1",
-    "torchvision==0.24.1+rocm7.2.1",
-    "torchaudio==2.9.1+rocm7.2.1",
-    "rocm[libraries,devel]==7.2.1",
-    "rocm-sdk-core==7.2.1",
-    "rocm-sdk-devel==7.2.1",
-    "rocm-sdk-libraries-custom==7.2.1",
+    "numpy>=2.0,<3",
+    "psutil>=7,<8",
+    "nbformat>=5.10,<6",
+    "datasets>=4.0,<5",
+    "evalplus==0.3.1",
+    "nvidia-ml-py>=12,<14",
 ]
-
-[tool.uv]
-environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
-
-[tool.uv.sources]
-torch = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl" }
-torchvision = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl" }
-torchaudio = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl" }
-rocm = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz" }
-rocm-sdk-core = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl" }
-rocm-sdk-devel = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl" }
-rocm-sdk-libraries-custom = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl" }

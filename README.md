@@ -1,10 +1,10 @@
-# wemakemodel
+# Putare
 
 **Gemma 4의 일부 Expert를 제거한 경량 모델을 만들고, 원본과 품질·실행 속도를 비교하는 노트북 기반 실험 도구입니다.** 수학·코딩 입력에서 어떤 Expert가 사용되고 출력에 얼마나 기여하는지 분석하여, 유지할 Expert 집합을 선택합니다.
 
 MoE(Mixture of Experts) 모델은 입력 토큰마다 Router가 여러 Expert 중 일부를 골라 계산합니다. 이 프로젝트에서 사용하는 **정적 Expert Pruning**은 사용할 Expert를 미리 정하고 나머지 가중치를 모델 파일에서 제거하는 방식입니다. 남겨 둔 Expert 사이의 선택은 기존 Router가 계속 수행합니다.
 
-대상 모델은 `gemma-4-26B-A4B-it-UD-IQ4_NL.gguf`입니다. Windows의 AMD GPU 환경에서 Python 3.12, Jupyter, llama.cpp 기반 실험 엔진을 사용합니다.
+대상 모델은 `gemma-4-26B-A4B-it-UD-IQ4_NL.gguf`입니다. Colab의 NVIDIA A100과 Linux CUDA 환경에서 Python 3.12, Jupyter, llama.cpp 기반 실험 엔진을 사용합니다.
 
 ## 무엇을 할 수 있나요?
 
@@ -17,17 +17,25 @@ MoE(Mixture of Experts) 모델은 입력 토큰마다 Router가 여러 Expert �
 
 ## 시작하기
 
-주 실행 파일은 [Gemma 4 Expert Pruning 연구 노트북](ipynb/01_Gemma4_Expert_Pruning_연구.ipynb)입니다. 대상 GGUF 모델 파일을 `models/`에 준비한 뒤 노트북을 엽니다.
+주 실행 파일은 [Gemma 4 Expert Pruning 연구 노트북](ipynb/01_base_model_분석.ipynb)입니다. 대상 GGUF 모델 파일을 `models/`에 준비한 뒤 노트북을 엽니다.
 
 ### 준비할 것
 
 - Python 3.12와 Jupyter 환경
 - `models/gemma-4-26B-A4B-it-UD-IQ4_NL.gguf` 모델 파일
 - `requirements-research.txt`의 실험용 Python 의존성
-- CMake·Ninja·C++ 빌드 도구·AMD HIP SDK를 갖춘 [native 엔진 빌드 환경](tools/native/README.md)
+- CMake·Ninja·C++ 빌드 도구·CUDA toolkit을 갖춘 Colab 환경
 - 원본과 별도로 생성할 GGUF 파일을 저장할 디스크 여유 공간
 
-PyTorch ROCm 패키지 설치와 HIP 컴파일러 준비는 별도입니다. 실행 전에 노트북의 `MODEL`, `GPU_TARGET`, `CONFIG`를 사용 환경에 맞게 확인하세요. 기본 컨텍스트는 16K이며, `n_gpu_layers=24`로 일부 레이어를 GPU에 적재합니다. 메모리 여유를 감시하지만, 모든 환경에서 실행을 보장하는 설정은 아닙니다.
+Colab에서 저장소와 모델을 준비하고 A100 커널을 선택하세요. 기존 Colab PyTorch는 교체하지 않습니다.
+노트북의 준비 플래그를 켜 필요한 Python 도구, 고정 revision의 CUDA 엔진과 공식 채점기를 준비합니다.
+전체 GPU 적재를 요청하고 시스템 RAM 80%, 전체 VRAM 97%를 넘으면 경고 후 계속합니다.
+이 기준은 강제 한도가 아니므로 순간적인 할당 실패나 런타임 종료를 방지하지 못합니다.
+
+02번은 원본 벤치마크, 03번은 ordered 모델, 04번은 104개 모델, 05번은 80개 모델을 다룹니다.
+02·04·05번의 채점 셀은 추론 프로세스 종료 후 공식 채점기를 별도 프로세스로 실행합니다.
+생성 코드는 Colab 사용자 권한으로 실행되며 보안 격리되지 않습니다.
+런타임 저장소는 임시이므로 필요한 모델과 결과는 별도 영구 저장소에 보관하세요.
 
 ### 실행 흐름
 
@@ -49,7 +57,7 @@ PyTorch ROCm 패키지 설치와 HIP 컴파일러 준비는 별도입니다. 실
 | 수학 자동 점수 | 마지막 숫자 추출을 이용한 탐색용 지표입니다. 기호식은 수동 검토가 필요하며 MATH-500 정확도로 해석할 수 없습니다. |
 | 코딩 평가 | 생성과 구문 분석까지 수행합니다. 코드 실행 정답률(HumanEval+/MBPP+)은 측정하지 않습니다. |
 | 모델 파일 크기 | 저장 공간의 변화입니다. VRAM 감소나 Expert 전송 제거를 의미하지 않습니다. |
-| GPU 메모리 | native 엔진의 할당 peak·실제 CPU/GPU 배치·Expert 전송은 미관측입니다. Windows PDH 표본은 별도의 OS 프로세스 GPU 메모리 지표이며, 미지원·실패는 `null`과 사유로 기록합니다. |
+| GPU 메모리 | native 엔진의 할당 peak·실제 CPU/GPU 배치·Expert 전송은 미관측입니다. NVML GPU 전체 사용량과 프로세스별 표본은 구분하며, 미지원·실패는 `null`과 사유로 기록합니다. |
 | 실행 속도 | 계측을 끄고 프로세스 내부 워밍업 후 5회 반복합니다. 같은 엔진·입력·템플릿·Top-K·컨텍스트·offload 설정끼리 비교해야 합니다. |
 
 노트북의 Unsloth 공개 모델 점수는 참고 자료이며, 대상 GGUF 파일을 로컬에서 측정한 값과 구분합니다.

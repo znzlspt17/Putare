@@ -5,7 +5,7 @@ import hashlib
 import ast
 import io
 import json
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 import re
 import subprocess
 import tempfile
@@ -17,9 +17,9 @@ LCB_COMMIT = '28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24'
 AIME_REPO = 'MathArena/aime_2026'
 LCB_REPO = 'livecodebench/code_generation_lite'
 LCB_INDEX_SPACE = 'livecodebench/code_generation_samples'
-WSL_DISTRO = 'Ubuntu-24.04'
-WSL_VENV = '/home/vivy/.venvs/wemakemodel-lcb'
-WSL_SOURCE = f'/home/vivy/.cache/wemakemodel/livecodebench/{LCB_COMMIT}'
+ROOT = Path(__file__).resolve().parents[1]
+GRADER_VENV = ROOT / '.cache/putare-lcb/venv'
+GRADER_SOURCE = ROOT / '.cache/putare-lcb/livecodebench' / LCB_COMMIT
 
 
 def select_v6_new(v5, v6, expected=175):
@@ -57,16 +57,9 @@ def aime_answer(text):
     return int(found[-1]) if found else None
 
 
-def windows_to_wsl_path(path):
-    value = PureWindowsPath(str(path))
-    if not re.fullmatch(r'[a-zA-Z]:', value.drive) or not value.is_absolute():
-        raise ValueError('WSL 경로 변환에는 로컬 드라이브 절대 경로가 필요합니다')
-    return '/mnt/' + value.drive[0].lower() + '/' + '/'.join(value.parts[1:])
-
-
 def _open_public(url, timeout=60):
     # 인증 캐시와 프록시 인증정보를 자동 탐색하지 않는 공개 HTTPS 요청만 허용한다.
-    request = urllib.request.Request(url, headers={'User-Agent': 'wemakemodel-benchmark/1'})
+    request = urllib.request.Request(url, headers={'User-Agent': 'putare-benchmark/1'})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     return opener.open(request, timeout=timeout)
 
@@ -132,15 +125,23 @@ def _aime_rows(revision):
     return rows, hashlib.sha256(raw).hexdigest()
 
 
-def _wsl(*args, check=True, capture_output=False):
-    return subprocess.run(['wsl.exe', '--distribution', WSL_DISTRO, '--exec', *map(str, args)],
-                          check=check, capture_output=capture_output, text=True, encoding='utf-8')
+def grader_paths(root):
+    root = Path(root).resolve()
+    return root / '.cache/putare-lcb/venv', root / '.cache/putare-lcb/livecodebench' / LCB_COMMIT
 
 
-def prepare_wsl(root):
-    """사용자가 준비 셀을 켠 경우에만 공개 소스와 전용 venv를 설치한다."""
-    script = windows_to_wsl_path(Path(root).resolve() / 'tools/lcb_prepare.py')
-    return _wsl('python3', script)
+def prepare_grader(root):
+    """2026-11-09: 공개 채점기와 전용 환경은 사용자가 준비 셀을 켤 때만 만든다."""
+    from tools.lcb_prepare import prepare
+    return prepare(root)
+
+
+def _grader_tool(root, *args, capture_output=False, timeout_s=None):
+    from .grading import worker_environment
+    venv, source = grader_paths(root)
+    return subprocess.run([str(venv / 'bin/python'), '-I', '-B', str(Path(root).resolve() / 'tools/lcb_grade.py'),
+                           *map(str, args), '--official-source', str(source)], env=worker_environment(),
+                          check=True, capture_output=capture_output, text=True, encoding='utf-8', timeout=timeout_s)
 
 
 def _official_prompts(root, rows):
@@ -151,22 +152,20 @@ def _official_prompts(root, rows):
         folder = Path(folder)
         source, dest = folder / 'prompts-in.json', folder / 'prompts-out.json'
         write_json(source, [{'question_content': r['question_content'], 'starter_code': r['starter_code']} for r in rows])
-        _wsl(f'{WSL_VENV}/bin/python', windows_to_wsl_path(root / 'tools/lcb_grade.py'),
-             '--prompts', '--official-source', WSL_SOURCE, '--input', windows_to_wsl_path(source),
-             '--output', windows_to_wsl_path(dest))
+        _grader_tool(root, '--prompts', '--input', source, '--output', dest)
         return json.loads(dest.read_text(encoding='utf-8'))
 
 
-def official_identity(root):
-    checked = _wsl(f'{WSL_VENV}/bin/python', windows_to_wsl_path(Path(root).resolve() / 'tools/lcb_grade.py'),
-                   '--verify', '--official-source', WSL_SOURCE, capture_output=True)
+def official_identity(root, *, timeout_s=None):
+    checked = _grader_tool(root, '--verify', capture_output=True, timeout_s=timeout_s)
     return json.loads(checked.stdout)
 
 
 def grader_identity(root):
     root = Path(root).resolve()
-    names = ('tools/lcb_grade.py', 'tools/lcb_sandbox.sh', 'tools/lcb_sandbox.py')
-    return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
+    names = ('tools/lcb_grade.py', 'moe_prune/grading.py')
+    return {**{name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names},
+            'execution_mode': 'unisolated'}
 
 
 def prepare_snapshot(destination, root):
@@ -276,6 +275,17 @@ def grading_cache_key(payload, official, grader, proof):
 
 
 def grade_snapshot(destination, generations, run_dir, root):
+    from .execution_safety import execution_guard
+    from .grading import GradeDeadline
+    run_dir = Path(run_dir).resolve()
+    if Path(generations).resolve() != run_dir / 'generations.jsonl':
+        raise ValueError('생성 결과는 실행 폴더의 generations.jsonl이어야 합니다')
+    identity = json.loads((run_dir / 'benchmark-identity.json').read_text(encoding='utf-8'))
+    with execution_guard('grading', memory_config=identity.get('config')) as guard:
+        return _grade_snapshot(destination, generations, run_dir, root, guard, GradeDeadline())
+
+
+def _grade_snapshot(destination, generations, run_dir, root, guard, deadline):
     """2026-11-06: 채점기 실패를 모델 오답으로 바꾸지 않고 완료 결과만 요약한다."""
     from .base_benchmark import load_completed
     from .gguf import sha256
@@ -304,19 +314,25 @@ def grade_snapshot(destination, generations, run_dir, root):
         by_id[row['id']] = row
     if set(by_id) != {row['id'] for row in records}:
         raise ValueError('생성이 완료되지 않아 전체 점수를 산출할 수 없습니다')
-    official = official_identity(root)
-    if official != manifest.get('official_identity'):
-        raise ValueError('공식 채점기 또는 환경이 snapshot과 다릅니다')
+    official = official_identity(root, timeout_s=deadline.remaining())
+    if official.get('source_digest') != manifest.get('official_identity', {}).get('source_digest'):
+        raise ValueError('공식 채점기 source가 snapshot과 다릅니다')
     grader = grader_identity(root)
-    if grader != manifest.get('grader_identity'):
-        raise ValueError('채점 어댑터 또는 격리 도구가 snapshot과 다릅니다')
-    sandbox = root / 'tools/lcb_sandbox.sh'
-    if not sandbox.is_file():
-        raise RuntimeError('격리 채점 wrapper가 없어 실행할 수 없습니다')
+    if (manifest.get('grader_identity', {}).get('tools/lcb_grade.py') != grader['tools/lcb_grade.py'] or
+            identity.get('grader_identity') != grader or identity.get('official_identity') != official):
+        raise ValueError('현재 채점기 identity가 생성 당시와 다릅니다')
+    from .grading import run as run_grade
+    venv, official_source = grader_paths(root)
     results = []
     grade_dir = run_dir / 'grade-cache'
     grade_dir.mkdir(parents=True, exist_ok=True)
     for number, row in enumerate(records, 1):
+        try:
+            deadline.remaining()
+        except TimeoutError as error:
+            write_json(run_dir / 'grading-status.json', {'complete': False, 'id': row['id'],
+                       'status': 'infrastructure_error', 'error_type': type(error).__name__, 'completed': len(results)})
+            raise
         generation = by_id[row['id']]
         print(f'채점 {number}/{len(records)}: {row["id"]}', flush=True)
         if row['domain'] == 'math':
@@ -342,8 +358,13 @@ def grade_snapshot(destination, generations, run_dir, root):
                 temporary = Path(temp)
                 input_path, output_path = temporary / 'input.json', temporary / 'output.json'
                 write_json(input_path, payload)
-                _wsl('bash', windows_to_wsl_path(sandbox), WSL_SOURCE, WSL_VENV,
-                     windows_to_wsl_path(input_path), windows_to_wsl_path(output_path))
+                try:
+                    run_grade(official_source, venv, input_path, output_path,
+                              memory_config=identity.get('config'), guard=guard, timeout_s=deadline.remaining())
+                except Exception as error:
+                    write_json(run_dir / 'grading-status.json', {'complete': False, 'id': row['id'],
+                               'status': 'infrastructure_error', 'error_type': type(error).__name__})
+                    raise
                 if not output_path.is_file():
                     raise RuntimeError('공식 채점기가 결과를 생성하지 않았습니다')
                 graded = json.loads(output_path.read_text(encoding='utf-8'))

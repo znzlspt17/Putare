@@ -176,11 +176,25 @@ int main(int argc,char ** argv) {
     std::ofstream output;
     llama_model * model=nullptr; llama_context * context=nullptr; llama_batch_ext * batch=nullptr;
     llama_sampler * sampler=nullptr;
+    // 2026-11-07: callback이 보관하는 주소를 세션 전체에서 고정한다.
+    observer state;
+    json session_config;
+    const bool session=argc==2 && std::string(argv[1])=="--session";
+    bool backend_started=false;
     try {
-        if(argc!=5 || std::string(argv[1])!="--request" || std::string(argv[3])!="--output") throw std::runtime_error("usage: --request request.json --output result.jsonl");
-        std::ifstream input(argv[2]); if(!input) throw std::runtime_error("request not readable");
+        if(!session && (argc!=5 || std::string(argv[1])!="--request" || std::string(argv[3])!="--output")) throw std::runtime_error("usage: --request request.json --output result.jsonl | --session");
+        while(true) {
+        std::string request_path, output_path;
+        if(session) {
+            std::string line;
+            if(!std::getline(std::cin,line)) break;
+            const json command=json::parse(line);
+            request_path=command.at("request").get<std::string>();
+            output_path=command.at("output").get<std::string>();
+        } else { request_path=argv[2]; output_path=argv[4]; }
+        std::ifstream input(request_path); if(!input) throw std::runtime_error("request not readable");
         const json request=json::parse(input);
-        output.open(argv[4],std::ios::out|std::ios::trunc); if(!output) throw std::runtime_error("output not writable");
+        output.open(output_path,std::ios::out|std::ios::trunc); if(!output) throw std::runtime_error("output not writable");
         const std::string mode=request.value("mode",std::string("generate"));
         if(mode!="generate" && mode!="profile" && mode!="logits" && mode!="reference_loss") throw std::runtime_error("unsupported mode");
         const int limit=request.value("max_tokens",256), n_ctx=request.value("context_size",8192);
@@ -195,7 +209,7 @@ int main(int argc,char ** argv) {
         const std::string cache_v=request.value("cache_type_v",std::string("f16"));
         if((cache_k!="f16" && cache_k!="q8_0") || (cache_v!="f16" && cache_v!="q8_0"))
             throw std::runtime_error("unsupported cache type");
-        observer state; state.output=&output; state.enabled=request.value("instrumentation",mode=="profile");
+        state=observer{}; state.output=&output; state.enabled=request.value("instrumentation",mode=="profile");
         state.all_token_logits=request.value("all_token_logits",false);
         const bool warmup=request.value("warmup",false);
         if(warmup && (state.enabled || mode!="generate")) throw std::runtime_error("warmup requires uninstrumented generate mode");
@@ -207,16 +221,19 @@ int main(int argc,char ** argv) {
                 for(const int id:it.value()) if(!state.allow[layer].insert(id).second) throw std::runtime_error("duplicate expert id");
             }
         }
-        // 2026-11-06: HIP fusion은 scheduler 관측 유무에 따라 출력을 바꾸므로 모든 실험에서 일관된 비융합 경로를 사용한다.
-#ifdef _WIN32
-        if (_putenv_s("GGML_CUDA_DISABLE_FUSION", "1") != 0) throw std::runtime_error("failed to disable HIP fusion");
-#else
-        if (setenv("GGML_CUDA_DISABLE_FUSION", "1", 1) != 0) throw std::runtime_error("failed to disable HIP fusion");
-#endif
-        llama_backend_init();
+        // 2026-11-09: CUDA fusion이 계측 경로에 영향을 줄 수 있으므로 동일한 비융합 경로를 사용한다.
+        if (setenv("GGML_CUDA_DISABLE_FUSION", "1", 1) != 0) throw std::runtime_error("failed to disable CUDA fusion");
+        const json fixed={{"model",request.at("model")},{"n_gpu_layers",request.value("n_gpu_layers",0)},
+            {"context_size",n_ctx},{"cache_k",cache_k},{"cache_v",cache_v},
+            {"flash_attention",request.value("flash_attention",false)},
+            {"offload_kqv",request.value("offload_kqv",true)},
+            {"instrumentation",state.enabled},{"allowlist",request.value("allowlist",json(nullptr))}};
+        if(model && fixed!=session_config) throw std::runtime_error("session model/context configuration changed");
+        if(!backend_started) { llama_backend_init(); backend_started=true; }
         const auto load_start=clock_type::now();
         auto model_params=llama_model_default_params(); model_params.n_gpu_layers=request.value("n_gpu_layers",0);
-        model=llama_model_load_from_file(request.at("model").get<std::string>().c_str(),model_params);
+        const bool first=!model;
+        if(first) { model=llama_model_load_from_file(request.at("model").get<std::string>().c_str(),model_params); session_config=fixed; }
         if(!model) throw std::runtime_error("model load failed");
         char arch[128];
         if(llama_model_meta_val_str(model,"general.architecture",arch,sizeof(arch))<=0) throw std::runtime_error("missing model architecture");
@@ -256,7 +273,14 @@ int main(int argc,char ** argv) {
         if(request.contains("flash_attention")) params.flash_attn_type=request.at("flash_attention").get<bool>() ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if(request.contains("offload_kqv")) params.offload_kqv=request.at("offload_kqv").get<bool>();
         if(state.enabled || !state.allow.empty()) { params.cb_eval=callback; params.cb_eval_user_data=&state; }
-        context=llama_init_from_model(model,params); if(!context) throw std::runtime_error("context creation failed");
+        if(first) { context=llama_init_from_model(model,params); if(!context) throw std::runtime_error("context creation failed"); }
+        else {
+            // 기존 문제의 KV와 callback 통계를 지우되 모델과 할당된 context는 유지한다.
+            llama_synchronize(context);
+            auto memory=llama_get_memory(context);
+            if(!memory) throw std::runtime_error("session requires resettable KV memory");
+            llama_memory_clear(memory,true);
+        }
         if(temperature>0) {
             sampler=llama_sampler_chain_init(llama_sampler_chain_default_params());
             if(!sampler) throw std::runtime_error("sampling initialization failed");
@@ -265,8 +289,8 @@ int main(int argc,char ** argv) {
             llama_sampler_chain_add(sampler,llama_sampler_init_temp(temperature));
             llama_sampler_chain_add(sampler,llama_sampler_init_dist(request.value("seed",42u)));
         }
-        batch=llama_batch_ext_init(context);
-        const double load_seconds=elapsed(load_start);
+        if(first) batch=llama_batch_ext_init(context);
+        const double load_seconds=first ? elapsed(load_start) : 0.0;
         if(warmup) {
             // 2026-11-05: 같은 프로세스에서 kernel/prompt 경로를 준비한 후 KV를 지워 실제 측정 문맥을 분리한다.
             int warm_position=0;
@@ -341,11 +365,18 @@ int main(int argc,char ** argv) {
             {"timings",{{"load_s",load_seconds},{"ttft_s",mode=="logits" || mode=="reference_loss"?json(nullptr):json(ttft)},
                 {"prefill_tokens_s",tokens.size()/prefill_seconds},{"decode_tokens_s",generated.size()>1?json((generated.size()-1)/decode_seconds):json(nullptr)}}}};
         output << result.dump(-1,' ',false,json::error_handler_t::replace) << '\n'; output.flush();
-        if(sampler) llama_sampler_free(sampler); llama_batch_ext_free(batch); llama_free(context); llama_model_free(model); llama_backend_free(); return 0;
+        if(!output) throw std::runtime_error("result output failed");
+        output.close();
+        if(!output) throw std::runtime_error("result output close failed");
+        if(sampler) { llama_sampler_free(sampler); sampler=nullptr; }
+        if(!session) break;
+        std::cout << json({{"status","ok"}}).dump() << std::endl;
+        }
+        if(batch) llama_batch_ext_free(batch); if(context) llama_free(context); if(model) llama_model_free(model); if(backend_started) llama_backend_free(); return 0;
     } catch(const std::exception & error) {
         if(output) output << json({{"type","error"},{"message",error.what()}}).dump() << '\n';
         std::cerr << error.what() << '\n';
-        if(sampler) llama_sampler_free(sampler); if(batch) llama_batch_ext_free(batch); if(context) llama_free(context); if(model) llama_model_free(model);
+        if(sampler) llama_sampler_free(sampler); if(batch) llama_batch_ext_free(batch); if(context) llama_free(context); if(model) llama_model_free(model); if(backend_started) llama_backend_free();
         return 1;
     }
 }

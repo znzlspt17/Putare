@@ -18,6 +18,18 @@ def event(layer, phase, index, expert=0):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_full_run_rejects_changed_grader_before_loading_model(self):
+        records = [{'id': f'{domain}:{i}', 'domain': domain, 'dataset': domain, 'prompt': 'x'}
+                   for domain, count in [('math', 30), ('code', 175)] for i in range(count)]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch('moe_prune.benchmark_data.load_snapshot', return_value=(records, {'grader_identity': {'tools/lcb_grade.py': 'old'}})), \
+                 patch('moe_prune.benchmark_data.validate_id_proof', return_value={}), \
+                 patch('moe_prune.benchmark_data.grader_identity', return_value={'tools/lcb_grade.py': 'new'}), \
+                 patch('moe_prune.base_benchmark.GGUF', side_effect=AssertionError('model opened')):
+                with self.assertRaisesRegex(ValueError, '채점'):
+                    BenchmarkRun({}, root / 'model', root / 'engine', root / 'snapshot', root / 'run').run()
+
     def test_full_run_identity_includes_verified_v5_proof(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -34,14 +46,22 @@ class BenchmarkTests(unittest.TestCase):
             class FakeModel:
                 def architecture(self): return list(range(30)), 128, 8
             proof = {'status': 'verified', 'v5_count': 880, 'v6_new_count': 175}
-            with patch('moe_prune.benchmark_data.load_snapshot', return_value=(records, {})), \
+            old_manifest={'grader_identity': {'tools/lcb_grade.py':'same', 'tools/lcb_sandbox.py':'old'},
+                          'official_identity': {'source_digest':'trusted','python':'3.12.3'}}
+            current_grader={'tools/lcb_grade.py':'same','moe_prune/grading.py':'new','execution_mode':'unisolated'}
+            current_official={'source_digest':'trusted','python':'3.12.9'}
+            with patch('moe_prune.benchmark_data.load_snapshot', return_value=(records, old_manifest)), \
                  patch('moe_prune.benchmark_data.validate_id_proof', return_value=proof), \
+                 patch('moe_prune.benchmark_data.grader_identity', return_value=current_grader), \
+                 patch('moe_prune.benchmark_data.official_identity', return_value=current_official), \
                  patch('moe_prune.base_benchmark.GGUF', return_value=FakeModel()), \
-                 patch('moe_prune.base_benchmark.Experiment', side_effect=RuntimeError('stop after identity')):
+                 patch('moe_prune.base_benchmark.ResidentExperiment', side_effect=RuntimeError('stop after identity')):
                 with self.assertRaisesRegex(RuntimeError, 'stop after identity'):
                     BenchmarkRun({}, model, engine, snapshot, root / 'run').run()
             identity = json.loads((root / 'run' / 'benchmark-identity.json').read_text(encoding='utf8'))
             self.assertEqual(identity['lcb_v5_id_proof'], canonical_hash(proof))
+            self.assertEqual(identity['grader_identity'], current_grader)
+            self.assertEqual(identity['official_identity'], current_official)
 
     def test_full_run_requires_v5_id_proof_before_model_or_output(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -97,6 +117,9 @@ class BenchmarkTests(unittest.TestCase):
                 def architecture(self): return list(range(30)), 128, 8
             class FakeExperiment:
                 def __init__(self, path, config): self.root = Path(path)
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+                def check(self): pass
                 def run(self, name, request):
                     calls.append(request)
                     job = self.root / 'jobs' / name
@@ -117,7 +140,7 @@ class BenchmarkTests(unittest.TestCase):
             with patch('moe_prune.base_benchmark.GGUF', return_value=FakeModel()), \
                  patch('moe_prune.benchmark_data.load_snapshot', return_value=(records, {})), \
                  patch('moe_prune.benchmark_data.validate_id_proof', side_effect=AssertionError('smoke should skip proof')), \
-                 patch('moe_prune.base_benchmark.Experiment', FakeExperiment):
+                 patch('moe_prune.base_benchmark.ResidentExperiment', FakeExperiment):
                 runner = BenchmarkRun({}, model, engine, snapshot, root / 'run')
                 self.assertEqual(runner.run(smoke=True)['completed'], 2)
                 self.assertEqual(len(calls), 2)
@@ -144,17 +167,13 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_completed(root / 'answer.json', 'q', 'config-a', root)
 
-    def test_memory_only_failures_try_next_placement(self):
+    def test_allocation_failure_does_not_change_placement(self):
         seen = []
         def invoke(placement):
             seen.append(placement)
-            if len(seen) < 3:
-                raise MemoryError('allocation')
-            return 'ok'
-        result, position = run_with_offload(invoke)
-        self.assertEqual(result, 'ok')
-        self.assertEqual(position, 2)
-        self.assertEqual(seen, [(24, True), (24, False), (20, True)])
+            raise MemoryError('allocation')
+        with self.assertRaises(MemoryError): run_with_offload(invoke)
+        self.assertEqual(seen, [(31, True)])
         with self.assertRaisesRegex(RuntimeError, 'corrupt'):
             run_with_offload(lambda _: (_ for _ in ()).throw(RuntimeError('corrupt')))
 

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import nullcontext
 from unittest.mock import patch
 
 from moe_prune.research import Experiment
@@ -25,12 +26,30 @@ class CompletedEngine:
 
 
 class RunIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        # 합성 엔진 테스트에서 실행 잠금은 별도 경계 테스트로 검증한다.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for field in ('_LOCK', '_POISON'):
+            isolated = patch('moe_prune.execution_safety.' + field, Path(temp.name) / field)
+            isolated.start()
+            self.addCleanup(isolated.stop)
+        patcher = patch('moe_prune.execution_safety.execution_guard', side_effect=lambda *a, **k: nullcontext())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ram = patch('moe_prune.memory_safety._ram_sample', return_value=(100000000000, 90000000000, 'fixture'))
+        ram.start()
+        self.addCleanup(ram.stop)
+        poison = patch('moe_prune.execution_safety.poison_execution')
+        poison.start()
+        self.addCleanup(poison.stop)
+
     def setup_experiment(self, directory):
         root = Path(directory)
         engine, model = root / "engine.exe", root / "model.gguf"
         engine.write_bytes(b"synthetic engine, never executed")
         model.write_bytes(b"synthetic input, not a real model")
-        config = {"engine": str(engine), "seed": 42, "context_size": 8192, "ram_budget_bytes": 40_000_000_000}
+        config = {"engine": str(engine), "seed": 42, "context_size": 8192, "ram_usage_warn_fraction": .80}
         return Experiment(root / "run", config), {"model": str(model), "prompt": "hello", "mode": "logits", "allowlist": None}, engine, model
 
     def test_completed_jobs_resume_without_external_execution(self):

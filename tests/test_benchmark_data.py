@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from moe_prune.benchmark_data import (aime_answer, final_answer,
-                                      select_v6_new, windows_to_wsl_path,
+                                      select_v6_new, grader_paths,
                                       prepare_snapshot, load_snapshot, grade_snapshot, _lcb_rows, validate_id_proof,
                                       grading_cache_key)
 from tools.lcb_grade import decode_cases
@@ -39,11 +39,11 @@ class BenchmarkDataTests(unittest.TestCase):
         self.assertEqual(aime_answer(final_answer(text)), 27)
         self.assertIsNone(aime_answer(final_answer('<|channel>thought\n\\boxed{42}')))
 
-    def test_windows_paths_map_to_wsl_mount(self):
-        self.assertEqual(windows_to_wsl_path(r'D:\Repos\wemakemodel\runs\my run'),
-                         '/mnt/d/Repos/wemakemodel/runs/my run')
-        with self.assertRaises(ValueError):
-            windows_to_wsl_path(r'\\server\share\file')
+    def test_grader_paths_are_relative_to_workspace(self):
+        with tempfile.TemporaryDirectory() as folder:
+            venv, source = grader_paths(folder)
+            self.assertEqual(venv, Path(folder).resolve()/'.cache/putare-lcb/venv')
+            self.assertEqual(source.parent, Path(folder).resolve()/'.cache/putare-lcb/livecodebench')
 
     def test_snapshot_uses_frozen_sources_and_detects_record_tampering(self):
         math = [{'problem_idx': i, 'problem': f'question {i}', 'answer': i} for i in range(30)]

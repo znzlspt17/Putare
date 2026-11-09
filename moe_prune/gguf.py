@@ -161,13 +161,22 @@ class GGUF:
         top_k = int(self.metadata["gemma4.expert_used_count"])
         return layers, experts, top_k
 
-    def rewrite(self, destination, allowlist=None):
-        """2026-11-05: 보존 가능한 Expert 최외곽 축만 스트리밍 절삭한다."""
+    def rewrite(self, destination, allowlist=None, *, permutation=None):
+        """2026-11-08: Expert 최외곽 축을 블록 그대로 절삭하거나 전체 순열로 재배치한다."""
         destination = Path(destination)
         if destination.resolve() == self.path.resolve() or destination.exists():
             raise FileExistsError("원본 또는 기존 산출물을 덮어쓸 수 없습니다")
         layers, experts, top_k = self.architecture()
-        mask = validate_allowlist({l: list(range(experts)) for l in layers} if allowlist is None else allowlist, layers, experts, top_k)
+        if allowlist is not None and permutation is not None:
+            raise ValueError("절삭 allowlist와 permutation을 동시에 지정할 수 없습니다")
+        if permutation is None:
+            mask = validate_allowlist({l: list(range(experts)) for l in layers} if allowlist is None else allowlist, layers, experts, top_k)
+        else:
+            # 2026-11-08: 절삭 정렬 규칙과 분리해 전체 Expert의 명시된 순서를 보존한다.
+            checked = validate_allowlist(permutation, layers, experts, top_k)
+            if any(len(ids) != experts for ids in checked.values()):
+                raise ValueError("순열은 모든 Expert를 정확히 한 번 포함해야 합니다")
+            mask = {int(layer): list(ids) for layer, ids in permutation.items()}
         keep = len(next(iter(mask.values())))
         plans = []
         seen = {layer: set() for layer in layers}
@@ -175,6 +184,8 @@ class GGUF:
             match = re.fullmatch(r"blk\.(\d+)\.(.+)", t.name)
             ids = None
             shape = t.shape
+            if permutation is not None and ("_exps" in t.name or "ffn_gate_inp." in t.name) and (not match or int(match[1]) not in mask):
+                raise ValueError(f"알 수 없는 Expert tensor 계층: {t.name}")
             if match and int(match[1]) in mask:
                 layer, suffix = int(match[1]), match[2]
                 is_router = suffix == "ffn_gate_inp.weight"

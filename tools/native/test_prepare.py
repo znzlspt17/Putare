@@ -10,50 +10,36 @@ spec.loader.exec_module(prepare)
 
 
 class PreparationTests(unittest.TestCase):
-    def test_no_gpu_architecture_is_invented(self):
-        for value in ("", "9070XT", "gfx1201;remove", "gfx"):
-            with self.assertRaises(ValueError):
-                prepare.build_commands(Path("source"), Path("build"), value)
+    def test_invalid_gpu_architecture_rejected(self):
+        for value in ('', '9070XT', '80;remove', 'gfx1201'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                prepare.build_commands(Path('source'), Path('build'), value)
 
-    def test_build_is_pinned_and_uses_real_hip_options(self):
-        commands = prepare.build_commands(Path("a source"), Path("a build"), "gfx1201")
-        self.assertEqual(len(prepare.COMMIT), 40)
-        self.assertIn("-DGGML_HIP=ON", commands[0])
-        self.assertIn("-DHIP_PLATFORM=amd", commands[0])
-        self.assertIn("-DGPU_TARGETS=gfx1201", commands[0])
-        self.assertIn("-DLLAMA_SOURCE_DIR=a source", commands[0])
-        self.assertEqual(commands[1][-3:], ["llama-expert-research", "--parallel", "2"])
+    def test_build_is_pinned_and_uses_cuda_options(self):
+        commands=prepare.build_commands(Path('a source'),Path('a build'),'8.0')
+        self.assertEqual(len(prepare.COMMIT),40)
+        self.assertIn('-DGGML_CUDA=ON',commands[0]);self.assertIn('-DGGML_HIP=OFF',commands[0])
+        self.assertIn('-DCMAKE_CUDA_ARCHITECTURES=80',commands[0])
+        self.assertIn('-DLLAMA_SOURCE_DIR=a source',commands[0])
+        self.assertEqual(commands[1][-3:],['llama-expert-research','--parallel','2'])
 
-    def test_probe_does_not_claim_missing_tool_available(self):
-        tools = prepare.preflight()
-        self.assertIn("clang++", tools)
-        self.assertTrue(all(value is None or isinstance(value, str) for value in tools.values()))
+    def test_probe_checks_cuda_compiler(self):
+        tools=prepare.preflight();self.assertIn('nvcc',tools)
+        self.assertTrue(all(value is None or isinstance(value,str) for value in tools.values()))
 
-    def test_sdk_device_bitcode_requires_real_directory(self):
-        with tempfile.TemporaryDirectory() as root:
-            sdk = Path(root)
-            self.assertIsNone(prepare.sdk_device_lib_path(sdk))
-            bitcode = sdk / 'lib' / 'llvm' / 'amdgcn' / 'bitcode'
-            bitcode.mkdir(parents=True)
-            self.assertEqual(prepare.sdk_device_lib_path(sdk), bitcode)
+    def test_public_git_does_not_use_user_credential_helpers(self):
+        env=prepare._git_environment()
+        self.assertEqual(env['GIT_TERMINAL_PROMPT'],'0')
+        self.assertEqual(env['GIT_CONFIG_GLOBAL'],__import__('os').devnull)
+        self.assertNotIn('GITHUB_TOKEN',env)
 
-    def test_discovers_workspace_local_build_tools_and_current_python_sdk(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            cmake = root / '.cache/native-tools/cmake/data/bin/cmake.exe'
-            ninja = root / '.cache/native-tools/bin/ninja.exe'
-            sdk = root / '.venv/Lib/site-packages/_rocm_sdk_devel'
-            clang = sdk / 'lib/llvm/bin/clang.exe'
-            clangxx = sdk / 'lib/llvm/bin/clang++.exe'
-            for path in (cmake, ninja, clang, clangxx):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
-            found = prepare.discover_local_tools(root, root / '.venv')
-            self.assertEqual(found['cmake'], cmake)
-            self.assertEqual(found['ninja'], ninja)
-            self.assertEqual(found['clang'], clang)
-            self.assertEqual(found['clang++'], clangxx)
-            self.assertEqual(found['rocm'], sdk)
+    def test_build_environment_excludes_unrelated_variables(self):
+        from unittest.mock import patch
+        fake={'PATH':'/bin','CUDA_HOME':'/opt/cuda','UNRELATED_TEST_VARIABLE':'synthetic'}
+        with patch.object(prepare.os, 'environ', fake):
+            env=prepare._build_environment()
+        self.assertEqual(env['CUDA_HOME'],'/opt/cuda')
+        self.assertNotIn('UNRELATED_TEST_VARIABLE',env)
 
     def test_runtime_masks_allow_single_layer_ablation(self):
         # 2026-11-05: compiler 부재 시 source 계약만 검증한다. native 실행 검증은 아니다.

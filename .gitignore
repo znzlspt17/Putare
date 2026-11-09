@@ -31,6 +31,7 @@ pytorch_model*.bin
 .vscode/
 .idea/
 .codex/
+download
 
 # 비밀 설정과 인증 자료
 .env

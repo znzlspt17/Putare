@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import psutil
@@ -36,12 +37,30 @@ class FailedEngine(EarlyEngine):
 
 
 class MonitorRaceTests(unittest.TestCase):
+    def setUp(self):
+        # 합성 엔진 테스트는 실제 WSL을 실행하지 않으며 경계는 별도 테스트한다.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for field in ('_LOCK', '_POISON'):
+            isolated = patch('moe_prune.execution_safety.' + field, Path(temp.name) / field)
+            isolated.start()
+            self.addCleanup(isolated.stop)
+        patcher = patch('moe_prune.execution_safety.execution_guard', side_effect=lambda *a, **k: nullcontext())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ram = patch('moe_prune.memory_safety._ram_sample', return_value=(100000000000, 90000000000, 'fixture'))
+        ram.start()
+        self.addCleanup(ram.stop)
+        poison = patch('moe_prune.execution_safety.poison_execution')
+        poison.start()
+        self.addCleanup(poison.stop)
+
     def setup_experiment(self, directory):
         root = Path(directory)
         model, engine = root / 'model.gguf', root / 'engine.exe'
         model.write_bytes(b'synthetic model')
         engine.write_bytes(b'synthetic executable')
-        exp = Experiment(root / 'run', {'engine': str(engine), 'seed': 42, 'context_size': 8192, 'ram_budget_bytes': 40_000_000_000})
+        exp = Experiment(root / 'run', {'engine': str(engine), 'seed': 42, 'context_size': 8192, 'ram_usage_warn_fraction': .80})
         return exp, {'model': str(model), 'prompt': 'test', 'mode': 'logits'}
 
     def test_completed_unsampled_memory_is_null(self):
@@ -71,3 +90,4 @@ class MonitorRaceTests(unittest.TestCase):
             failure = json.loads((exp.root / 'jobs/sample/failure.json').read_text(encoding='utf-8'))
             self.assertEqual(failure['returncode'], 7)
             self.assertFalse((exp.root / 'jobs/sample/measurement.json').exists())
+

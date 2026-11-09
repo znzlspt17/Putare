@@ -2,28 +2,25 @@
 
 이 도구는 upstream llama.cpp `10d4846a572aebf21c0482d140b00e74c0f1ad20`의 공개 C API, Jinja chat renderer와 scheduler evaluation callback에 연결한 **별도 실행 파일**이다. 원본 소스에 패치를 적용하지 않고 CMake의 `add_subdirectory`로 연결한다. 공식 `llama-cli`의 기존 옵션으로 관측·절삭 기능을 가장하지 않는다.
 
-## 준비와 빌드
+## Colab CUDA 준비와 빌드
 
-Windows Native Tools 환경에서 CMake 3.24+, Ninja, AMD HIP SDK의 clang/clang++, hip/hipblas/rocblas가 필요하다. PyTorch ROCm wheel만으로 compiler 환경을 충족한다고 가정하지 않는다. 아래 명령은 모델을 실행하지 않으며, `--execute`를 지정하기 전에는 진단과 명령만 출력한다.
+Colab의 NVIDIA A100, Python 3.12, CMake 3.24+, Ninja, C++ 컴파일러와 CUDA toolkit이 필요하다.
+노트북에서 PREPARE_ENGINE=True로 명령을 확인하고, 추가로 BUILD_ENGINE=True를 설정하면
+고정된 공개 llama.cpp revision을 준비해 CUDA backend로 빌드한다. 빌드는 모델을 실행하지 않는다.
+기존 checkout의 revision이나 작업 트리가 다르면 중단하며, 빌드 결과는
+.cache/llama-build/bin/llama-expert-research이다. 환경 검사는 다음 노트북 셀로도 실행할 수 있다.
 
-```powershell
-.\.venv\Scripts\python.exe tools/native/prepare.py
-# gfx 값은 hipInfo 등으로 실제 GPU에서 확인한다. 아래 placeholder를 그대로 실행하지 않는다.
-.\.venv\Scripts\python.exe tools/native/prepare.py --gpu-target <확인한-gfx값>
-.\.venv\Scripts\python.exe tools/native/prepare.py --gpu-target <확인한-gfx값> --execute
-```
+~~~python
+import subprocess, sys
+subprocess.run([sys.executable, 'tools/native/prepare.py', '--backend', 'cuda',
+                '--gpu-target', '80'], check=True)
+~~~
 
-빌드 결과는 `.cache/llama-build/bin/llama-expert-research.exe`다. HIP DLL과 llama/ggml DLL의 검색 경로가 필요하다. native runner의 Windows HIP 빌드·실제 Gemma4 추론은 사용자 환경에서 검증해야 하며, 준비 시 성공한 것으로 기록하지 않는다. 기존 checkout의 revision이나 dirty 상태가 다르면 도구가 중단한다.
+## 계측과 GPU fusion
 
-`--execute`는 저장소 `.cache/native-tools`의 CMake/Ninja, 현재 Python 환경의
-`_rocm_sdk_devel`, 설치된 Visual Studio의 C++ 환경을 자동 탐색한다. SDK의
-bitcode 경로와 빌드 환경은 해당 준비 프로세스에만 설정한다. 없는 도구를 자동 설치하거나
-그래픽 드라이버를 변경하지는 않는다. 추론 자식 프로세스는 필요한 OS/HIP 변수만 전달받고,
-현재 Python의 ROCm DLL 경로를 자식 PATH에서 사용한다.
-
-## 계측과 HIP fusion
-
-계측 유무에 따른 출력 차이를 방지하기 위해 연구 엔진은 모든 실행에서 HIP GPU fusion을 비활성화하고 결과에 `gpu_fusion_disabled: true`를 기록한다. 이전 엔진의 fusion 활성화 결과와 logits 및 속도가 달라질 수 있으므로 새 실행에서 원본과 축소 모델을 같은 엔진으로 다시 측정한다. 기존 결과는 보존하며 새 RUN_ID를 사용한다.
+연구 엔진은 동일한 계측 조건을 위해 GPU fusion을 비활성화하고
+gpu_fusion_disabled를 기록한다. 과거 환경과 다른 엔진·장비에서 얻은 결과는
+기존 결과와 구분하여 새 RUN_ID로 기록한다.
 
 ## 원본 모델의 로컬 기준 측정
 
@@ -51,23 +48,18 @@ TTFT, prefill 및 decode tokens/s를 반복 표본의 median/min/max로 보고�
 같다는 근거 없이 직접 비교하지 않는다. 속도는 로컬 하드웨어와 offload 설정에 의존하며,
 품질은 GPU 모델 차이만으로 설명하지 않는다.
 
-## 메모리 여유에 따른 실행 보호
+## 메모리 사용량 경고
 
-기본 실행 시간 제한과 고정 40GB RSS 상한은 없다. 시스템 가용 RAM 및 Windows commit
-여유를 각각 4GiB, GPU 전체 dedicated 사용량 기준 VRAM 여유를 1GiB 남기는지
-시작 전과 실행 중 약 100ms 간격으로 확인한다. 관측 실패나 여유 부족은 실행을 중단시킨다.
-
-사전 검사는 고정된 llama.cpp의 GPU 레이어 배치와 GGUF tensor 크기로 가중치 사용량을
-보수적으로 추정하고 workspace 추정 1GiB 및 VRAM 여유 1GiB를 추가한다.
-`n_gpu_layers`를 줄이면 일부 레이어를 CPU·RAM에서 처리하며, 전체 적재는 원본 파일 크기
-이상을 요구한다. 실제 배치는 엔진 로그로 별도 확인한다.
-workspace는 KV·계산 버퍼 필요량의 보장이 아니며, 이 감시는 메모리를 예약하거나
-순간 할당·드라이버 자체 장애를 차단하는 장치는 아니다.
+실제 Colab 시스템 RAM의 80%, 선택된 GPU 전체 VRAM의 97%를 초과하면 경고한다.
+기준을 초과해도 작업은 계속되며, 100ms 간격 표본은 메모리 할당을 강제로 제한하지 않는다.
+모델과 KV cache의 사전 필요량은 실제 모델과 설정을 바탕으로 추정한다.
+순간적인 할당 실패나 런타임 종료는 방지할 수 없다. 측정 불가능한 상태는 오류로 구분한다.
+전체 GPU 적재를 요청하고 실제 배치는 엔진 로그로 확인한다.
 
 ## 요청과 출력
 
 ```text
-llama-expert-research.exe --request request.json --output result.jsonl
+llama-expert-research --request request.json --output result.jsonl
 ```
 
 요청 필드:
@@ -110,6 +102,8 @@ callback은 `ask=true`에서 필요한 노드만 요청하고 `ask=false`에서 
 
 계층별 유지 수가 같아야 한다는 제약은 물리 GGUF export에만 적용한다. 런타임 Mask에서는 한 계층만128→127로 줄이는 제거 민감도 실험을 허용하며 나머지 계층은 그대로 유지한다. Mask를 사용하지 않는 요청은 `allowlist: null` 또는 해당 필드 생략으로 표현한다. 빈 객체는 누락 설정을 숨기지 않도록 거부한다.
 
-## 외부 Windows GPU memory 표본
+## GPU 메모리 표본
 
-`gpu_memory.ProcessGpuMemorySampler(pid)`는 PDH의 language-neutral `GPU Process Memory / Dedicated Usage` counter를 localized path로 변환·확장하여 해당 PID의 값만 수집한다. `sample()`을 외부 monitor loop에서 호출하고 `snapshot()`을 결과에 저장한다. adapter 합산 OS 프로세스 dedicated memory의 **표본 최대값**이며 HIP allocation peak나 Expert-only memory·실제 GPU 상주 증거가 아니다. 실패·counter 없음은 `None`과 사유로 남긴다. Windows counter 자체의 알려진 오차와 표본 사이 peak 누락 가능성을 문서화하므로 native runner의 미관측 `gpu_memory_bytes`를 이 값으로 몰래 대체하지 않는다.
+NVML이 측정하는 GPU 전체 사용량과 프로세스별 사용량을 구분한다.
+gpu_memory.ProcessGpuMemorySampler(pid)는 프로세스 메모리를 표본으로 기록하며,
+미지원·실패는 None과 사유를 남긴다. 표본 최대는 순간적인 실제 최대치를 보장하지 않는다.

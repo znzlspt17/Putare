@@ -18,12 +18,27 @@ from test_notebook_flow import SyntheticNative
 
 
 class BaselineNotebookTests(unittest.TestCase):
+    def setUp(self):
+        # 합성 엔진의 잠금 경계는 별도로 검증한다.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for field in ('_LOCK', '_POISON'):
+            isolated = patch('moe_prune.execution_safety.' + field, Path(temp.name) / field)
+            isolated.start()
+            self.addCleanup(isolated.stop)
+        patcher = patch('moe_prune.execution_safety.execution_guard', side_effect=lambda *args, **kwargs: contextlib.nullcontext())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        poison = patch('moe_prune.execution_safety.poison_execution')
+        poison.start()
+        self.addCleanup(poison.stop)
+
     def test_baseline_runs_without_pruning_or_writes(self):
         repository = Path(__file__).resolve().parents[1]
-        notebook = nbformat.read(repository / 'ipynb/01_Gemma4_Expert_Pruning_연구.ipynb', as_version=4)
+        notebook = nbformat.read(repository / 'ipynb/01_base_model_분석.ipynb', as_version=4)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            model, engine, data = root / 'model.gguf', root / 'engine.exe', root / 'data'
+            model, engine, data = root / 'model.gguf', root / 'engine', root / 'data'
             fixture(model, experts=128, top_k=8)
             engine.write_bytes(b'synthetic')
             groups = {split: [
@@ -38,11 +53,13 @@ class BaselineNotebookTests(unittest.TestCase):
                 'full_record_hashes': {key: canonical_hash(value) for key, value in groups.items()}})
             namespace = {'__name__': '__baseline_synthetic_test__'}
             captured = io.StringIO()
-            with patch('moe_prune.research.source_revision', return_value={'git_commit': 'synthetic', 'git_dirty': False}), \
+            with patch('platform.platform', return_value='Linux synthetic'), \
+                 patch('platform.processor', return_value='synthetic CPU'), \
+                 patch('moe_prune.research.source_revision', return_value={'git_commit': 'synthetic', 'git_dirty': False}), \
                  patch('moe_prune.research.baseline_environment', return_value={
                      'gpu': [{'name': 'synthetic GPU', 'driver_version': 'synthetic'}], 'ram_bytes': 123}, create=True), \
                  patch('moe_prune.research.subprocess.Popen', side_effect=SyntheticNative), \
-                 patch('moe_prune.memory_safety._available_memory', return_value=(64 * 1024**3, 64 * 1024**3)), \
+                 patch('moe_prune.memory_safety._ram_sample', return_value=(128 * 1024**3, 64 * 1024**3, 'synthetic')), \
                  patch('moe_prune.memory_safety.AdapterMemory') as adapter, \
                  patch('psutil.Process'), contextlib.redirect_stdout(captured):
                 adapter.return_value.sample.return_value = (16 * 1024**3, 0)
@@ -89,7 +106,7 @@ class BaselineNotebookTests(unittest.TestCase):
 
     def test_write_models_does_not_override_disabled_pruning(self):
         repository = Path(__file__).resolve().parents[1]
-        notebook = nbformat.read(repository / 'ipynb/01_Gemma4_Expert_Pruning_연구.ipynb', as_version=4)
+        notebook = nbformat.read(repository / 'ipynb/01_base_model_분석.ipynb', as_version=4)
         source = next(c.source for c in notebook.cells if c.cell_type == 'code' and "models/noop.gguf" in c.source)
         with tempfile.TemporaryDirectory() as directory:
             exp, original = Mock(), Mock()
@@ -103,7 +120,7 @@ class BaselineNotebookTests(unittest.TestCase):
 
     def test_original_speed_does_not_require_evaluation_or_exports(self):
         repository = Path(__file__).resolve().parents[1]
-        notebook = nbformat.read(repository / 'ipynb/01_Gemma4_Expert_Pruning_연구.ipynb', as_version=4)
+        notebook = nbformat.read(repository / 'ipynb/01_base_model_분석.ipynb', as_version=4)
         source = next(c.source for c in notebook.cells if c.cell_type == 'code' and 'speed_results = {}' in c.source)
         benchmark = Mock(return_value={'speed': 42})
         namespace = {'RUN_MODEL': True, 'RUN_BENCHMARK': True, 'gate_records': [{'id': 'x'}],
@@ -113,22 +130,25 @@ class BaselineNotebookTests(unittest.TestCase):
         self.assertEqual(namespace['speed_results'], {'original': {'speed': 42}})
         benchmark.assert_called_once()
 
-    def test_gpu_metadata_probe_timeout_is_unknown(self):
-        with patch('moe_prune.research.platform.system', return_value='Windows'), \
-             patch('moe_prune.research.subprocess.run', side_effect=subprocess.TimeoutExpired('probe', 10)):
+    def test_gpu_metadata_probe_failure_is_unknown(self):
+        with patch('tools.native.gpu_memory.NvmlDevice', side_effect=RuntimeError('unavailable')):
             observed = baseline_environment()
             self.assertIsNone(observed['gpu'])
             self.assertIn('physical_cores', observed['cpu'])
             self.assertIn('logical_cores', observed['cpu'])
 
-    def test_gpu_metadata_probe_decodes_single_or_multiple_adapters(self):
-        for rows in ({'Name': 'GPU A', 'DriverVersion': '1.2'},
-                     [{'Name': 'GPU A', 'DriverVersion': '1.2'}, {'Name': 'GPU B', 'DriverVersion': None}]):
-            with self.subTest(rows=rows), patch('moe_prune.research.platform.system', return_value='Windows'), \
-                 patch('moe_prune.research.subprocess.run', return_value=Mock(stdout=json.dumps(rows))):
-                expected = rows if isinstance(rows, list) else [rows]
-                self.assertEqual(baseline_environment()['gpu'],
-                                 [{'name': r['Name'], 'driver_version': r['DriverVersion']} for r in expected])
+    def test_gpu_metadata_probe_reports_selected_device(self):
+        device = Mock(name='nvml-device')
+        device.name = 'NVIDIA A100'
+        device.uuid = 'GPU-synthetic'
+        device.sample.return_value = (12345, 123)
+        device.nvml.nvmlSystemGetDriverVersion.return_value = b'1.2'
+        with patch('tools.native.gpu_memory.NvmlDevice', return_value=device):
+            self.assertEqual(baseline_environment()['gpu'], [{
+                'name': 'NVIDIA A100', 'uuid': 'GPU-synthetic',
+                'driver_version': '1.2', 'total_memory_bytes': 12345,
+            }])
+        device.close.assert_called_once()
 
 
 if __name__ == '__main__':

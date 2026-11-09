@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(wemakemodel_expert_research LANGUAGES C CXX)
+project(putare_expert_research LANGUAGES C CXX)
 if(NOT DEFINED LLAMA_SOURCE_DIR)
     message(FATAL_ERROR "Use prepare.py with a pinned llama.cpp source checkout")
 endif()

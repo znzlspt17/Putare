@@ -24,7 +24,7 @@ class BaseBenchmarkNotebookTests(unittest.TestCase):
             for index, cell in enumerate(notebook.cells):
                 if cell.cell_type == 'code':
                     exec(compile(cell.source, f'cell-{index}', 'exec'), namespace)
-        for key in ('PREPARE_WSL', 'PREPARE_ENGINE', 'BUILD_ENGINE', 'DOWNLOAD_DATA', 'VERIFY_DATA_IDS',
+        for key in ('INSTALL_DEPENDENCIES', 'PREPARE_GRADER', 'PREPARE_ENGINE', 'BUILD_ENGINE', 'DOWNLOAD_DATA', 'VERIFY_DATA_IDS',
                     'RUN_SMOKE', 'RUN_BENCHMARK', 'RUN_GRADING'):
             self.assertFalse(namespace[key], key)
         self.assertEqual(namespace['CONFIG']['context_size'], 65535)

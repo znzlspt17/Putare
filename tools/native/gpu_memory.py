@@ -1,161 +1,97 @@
-"""2026-11-05: OS 프로세스 dedicated GPU memory 표본. HIP allocation peak가 아니다.
-
-PDH English counter를 localized path로 바꾸고 wildcard를 확장하는 Microsoft 절차 사용:
-https://learn.microsoft.com/windows/win32/api/pdh/nf-pdh-pdhaddenglishcounterw
-Windows GPU Process Memory counter 자체의 알려진 제한:
-https://learn.microsoft.com/troubleshoot/windows-client/performance/gpu-process-memory-counters-report-wrong-value
-"""
-from __future__ import annotations
-import ctypes as ct
+"""Linux NVML GPU 메모리 관측. 표본은 실제 최고 사용량을 보장하지 않는다."""
 import os
-
-DWORD, STATUS, HANDLE = ct.c_uint32, ct.c_int32, ct.c_void_p
-MORE_DATA = 0x800007D2
-FMT_LARGE, FMT_NOSCALE = 0x400, 0x1000
+import psutil
 
 
-class _CounterInfo(ct.Structure):
-    _fields_ = [("length", DWORD), ("type", DWORD), ("version", DWORD), ("status", DWORD),
-                ("scale", ct.c_int32), ("default_scale", ct.c_int32),
-                ("user_data", ct.c_size_t), ("query_user_data", ct.c_size_t), ("full_path", ct.c_wchar_p)]
-
-
-class _ValueUnion(ct.Union):
-    _fields_ = [("large", ct.c_int64), ("double", ct.c_double), ("long", ct.c_int32), ("pointer", ct.c_void_p)]
-
-
-class _Value(ct.Structure):
-    _fields_ = [("status", DWORD), ("value", _ValueUnion)]
-
-
-def _code(value):
-    return int(value) & 0xFFFFFFFF
-
-
-def _check(value, action):
-    if _code(value):
-        raise OSError(f"{action}: PDH 0x{_code(value):08X}")
-
-
-class _PdhCounters:
-    def __init__(self, pid=None, english_path=None):
-        if os.name != "nt":
-            raise OSError("Windows PDH is unavailable on this OS")
-        self.dll = ct.WinDLL("pdh.dll")
-        signatures = {
-            "PdhOpenQueryW": ([ct.c_wchar_p, ct.c_size_t, ct.POINTER(HANDLE)], STATUS),
-            "PdhAddEnglishCounterW": ([HANDLE, ct.c_wchar_p, ct.c_size_t, ct.POINTER(HANDLE)], STATUS),
-            "PdhAddCounterW": ([HANDLE, ct.c_wchar_p, ct.c_size_t, ct.POINTER(HANDLE)], STATUS),
-            "PdhGetCounterInfoW": ([HANDLE, ct.c_int, ct.POINTER(DWORD), ct.c_void_p], STATUS),
-            "PdhExpandWildCardPathW": ([ct.c_wchar_p, ct.c_wchar_p, ct.c_wchar_p, ct.POINTER(DWORD), DWORD], STATUS),
-            "PdhCollectQueryData": ([HANDLE], STATUS),
-            "PdhGetFormattedCounterValue": ([HANDLE, DWORD, ct.POINTER(DWORD), ct.POINTER(_Value)], STATUS),
-            "PdhRemoveCounter": ([HANDLE], STATUS), "PdhCloseQuery": ([HANDLE], STATUS),
-        }
-        for name, (args, result) in signatures.items():
-            function = getattr(self.dll, name)
-            function.argtypes, function.restype = args, result
-        self.query, self.counters = HANDLE(), {}
-        _check(self.dll.PdhOpenQueryW(None, 0, ct.byref(self.query)), "open query")
-        seed = HANDLE()
+# 2026-11-09: CUDA와 NVML이 서로 다른 장치를 측정하는 상황을 거부한다.
+class NvmlDevice:
+    def __init__(self, gpu_uuid=None):
         try:
-            # 기본 프로세스 카운터는 PID를 제한하며, adapter 사용량 경로는 별도로 지정한다.
-            english = english_path or rf"\GPU Process Memory(pid_{int(pid)}_*)\Dedicated Usage"
-            _check(self.dll.PdhAddEnglishCounterW(self.query, english, 0, ct.byref(seed)), "add English counter")
-            size = DWORD(0)
-            code = self.dll.PdhGetCounterInfoW(seed, 0, ct.byref(size), None)
-            if _code(code) != MORE_DATA:
-                _check(code, "counter info size")
-            if not size.value:
-                raise OSError("PDH counter info is empty")
-            buffer = ct.create_string_buffer(size.value)
-            _check(self.dll.PdhGetCounterInfoW(seed, 0, ct.byref(size), buffer), "counter info")
-            self.localized = ct.cast(buffer, ct.POINTER(_CounterInfo)).contents.full_path
-            if not self.localized:
-                raise OSError("PDH localized path is empty")
-        except Exception:
-            self.close()
-            raise
-        finally:
-            if seed and self.query:
-                self.dll.PdhRemoveCounter(seed)
-
-    def read_named(self):
-        size = DWORD(0)
-        code = self.dll.PdhExpandWildCardPathW(None, self.localized, None, ct.byref(size), 0)
-        if _code(code) != MORE_DATA:
-            _check(code, "expand counter size")
-        if not size.value:
-            return {}
-        paths = ct.create_unicode_buffer(size.value)
-        _check(self.dll.PdhExpandWildCardPathW(None, self.localized, paths, ct.byref(size), 0), "expand counters")
-        current = set("".join(paths[:size.value]).strip("\0").split("\0"))
-        current.discard("")
-        for path in set(self.counters) - current:
-            self.dll.PdhRemoveCounter(self.counters.pop(path))
-        for path in current - set(self.counters):
-            counter = HANDLE()
-            _check(self.dll.PdhAddCounterW(self.query, path, 0, ct.byref(counter)), "add localized counter")
-            self.counters[path] = counter
-        if not self.counters:
-            return {}
-        _check(self.dll.PdhCollectQueryData(self.query), "collect")
-        values = {}
-        for path, counter in self.counters.items():
-            value = _Value()
-            code = self.dll.PdhGetFormattedCounterValue(counter, FMT_LARGE | FMT_NOSCALE, None, ct.byref(value))
-            if _code(code) == 0:
-                values[path] = (value.status, value.value.large)
+            import pynvml
+        except ImportError as error:
+            raise RuntimeError('NVML Python 바인딩이 필요합니다') from error
+        self.nvml = pynvml
+        pynvml.nvmlInit()
+        try:
+            visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+            if visible is not None:
+                entries = [x.strip() for x in visible.split(',') if x.strip()]
+                if len(entries) != 1:
+                    raise RuntimeError('단일 CUDA 장치를 지정해야 합니다')
+                token = entries[0]
+                if token.isdecimal() and pynvml.nvmlDeviceGetCount() != 1:
+                    raise RuntimeError('여러 GPU에서는 CUDA_VISIBLE_DEVICES에 UUID를 지정하세요')
+                handle = (pynvml.nvmlDeviceGetHandleByIndex(int(token)) if token.isdecimal()
+                          else pynvml.nvmlDeviceGetHandleByUUID(token.encode()))
             else:
-                # 일부 adapter만 성공한 합계는 실제 프로세스 값으로 보고하지 않는다.
-                values[path] = (_code(code), 0)
-        return values
-
-    def read(self):
-        return list(self.read_named().values())
-
-    def close(self):
-        if getattr(self, "query", None):
-            self.dll.PdhCloseQuery(self.query)
-            self.query = None
-
-
-class ProcessGpuMemorySampler:
-    """외부 monitor loop에서 sample() 호출. PID의 여러 adapter/segment counter를 합산한다."""
-    def __init__(self, pid, api=None):
-        self.pid, self.api = int(pid), api
-        self.peak, self.samples, self.reason = None, 0, None
-        try:
-            if self.pid <= 0:
-                raise ValueError("positive PID required")
-            if self.api is None:
-                self.api = _PdhCounters(self.pid)
-        except (OSError, ValueError, AttributeError) as error:
-            self.reason = str(error)
+                if pynvml.nvmlDeviceGetCount() != 1:
+                    raise RuntimeError('CUDA 장치가 모호합니다')
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            uuid = pynvml.nvmlDeviceGetUUID(handle)
+            self.uuid = uuid.decode() if isinstance(uuid, bytes) else str(uuid)
+            if gpu_uuid is not None and gpu_uuid != self.uuid:
+                raise RuntimeError('요청 GPU와 CUDA_VISIBLE_DEVICES가 다릅니다')
+            name = pynvml.nvmlDeviceGetName(handle)
+            self.name = name.decode() if isinstance(name, bytes) else str(name)
+            # 2026-11-09: NVML이 식별한 단일 GPU를 측정해 A100과 Blackwell을 모두 지원한다.
+            self.handle = handle
+        except BaseException:
+            pynvml.nvmlShutdown()
+            raise
 
     def sample(self):
-        if self.api is None:
-            return None
-        try:
-            rows = self.api.read()
-            if not rows or any(status not in (0, 1) or not isinstance(value, int) or value < 0 for status, value in rows):
-                self.reason = "No complete valid process GPU counter sample"
-                return None
-            current = sum(value for _, value in rows)
-            self.samples += 1
-            self.peak = current if self.peak is None else max(self.peak, current)
-            self.reason = None
-            return current
-        except (OSError, ValueError, AttributeError) as error:
-            self.reason = str(error)
-            return None
-
-    def snapshot(self):
-        return {"metric": "windows_process_gpu_dedicated_sampled", "pid": self.pid,
-                "peak_bytes": self.peak, "samples": self.samples, "unavailable_reason": self.reason,
-                "limitations": "OS PDH process dedicated memory; sums adapters, sampled peak only; not HIP allocation peak, expert-only bytes, or guaranteed physical residency. Windows counters may be inaccurate."}
+        memory = self.nvml.nvmlDeviceGetMemoryInfo(self.handle)
+        total, used = int(memory.total), int(memory.used)
+        if total <= 0 or not 0 <= used <= total:
+            raise RuntimeError('GPU 메모리 관측값이 잘못되었습니다')
+        return total, used
 
     def close(self):
-        if self.api is not None:
-            self.api.close()
-            self.api = None
+        self.nvml.nvmlShutdown()
+
+
+# 2026-11-09: 프로세스 측정은 전체 GPU 사용률과 구별하며 지원되지 않으면 미측정으로 남긴다.
+class ProcessGpuMemorySampler:
+    def __init__(self, pid, api=None):
+        self.pid, self.peak, self.samples = pid, None, 0
+        self.reason = None
+        try:
+            self.device = api or NvmlDevice()
+        except Exception as error:
+            self.device = None
+            self.reason = type(error).__name__
+
+    def sample(self):
+        if self.device is None:
+            return
+        try:
+            device = self.device
+            process = psutil.Process(self.pid)
+            ids = {self.pid, *(child.pid for child in process.children(recursive=True))}
+            nvml = device.nvml
+            rows = nvml.nvmlDeviceGetComputeRunningProcesses(device.handle)
+            matching = [p for p in rows if p.pid in ids]
+            if not matching:
+                self.reason = 'ProcessNotObserved'
+                return None
+            unavailable = getattr(nvml, 'NVML_VALUE_NOT_AVAILABLE', 0xffffffffffffffff)
+            if any(p.usedGpuMemory is None or p.usedGpuMemory == unavailable for p in matching):
+                raise RuntimeError('프로세스 GPU 메모리 미지원')
+            used = sum(int(p.usedGpuMemory) for p in matching)
+            if used < 0:
+                raise RuntimeError('프로세스 GPU 메모리 값 오류')
+            self.peak = max(self.peak or 0, used)
+            self.samples += 1
+            self.reason = None
+            return used
+        except Exception as error:
+            self.reason = type(error).__name__
+
+    def snapshot(self):
+        return {'peak_bytes': self.peak, 'samples': self.samples, 'unavailable_reason': self.reason,
+                'limitations': 'NVML 프로세스 메모리 표본 최대치; 물리적 최고치 보장 없음.'}
+
+    def close(self):
+        if self.device is not None:
+            self.device.close()
+            self.device = None

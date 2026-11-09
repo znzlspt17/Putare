@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import nullcontext
 import sys
 import subprocess
 from unittest.mock import patch
@@ -50,11 +51,26 @@ class LongEngine(RunningEngine):
 
 
 class MemorySafetyTests(unittest.TestCase):
+    def setUp(self):
+        # 합성 엔진 테스트에서 실행 잠금은 별도 경계 테스트로 검증한다.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for field in ('_LOCK', '_POISON'):
+            isolated = patch('moe_prune.execution_safety.' + field, Path(temp.name) / field)
+            isolated.start()
+            self.addCleanup(isolated.stop)
+        patcher = patch('moe_prune.execution_safety.execution_guard', side_effect=lambda *a, **k: nullcontext())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        poison = patch('moe_prune.execution_safety.poison_execution')
+        poison.start()
+        self.addCleanup(poison.stop)
+
     def make_experiment(self, root):
         model, engine = root / 'model', root / 'engine'
         model.write_bytes(b'model')
         engine.write_bytes(b'engine')
-        config = {'engine': str(engine), 'seed': 42, 'context_size': 8192, 'ram_budget_bytes': None}
+        config = {'engine': str(engine), 'seed': 42, 'context_size': 8192, 'ram_usage_warn_fraction': .80}
         return Experiment(root / 'run', config), {'model': str(model), 'prompt': 'hello', 'mode': 'logits'}
 
     def test_default_timeout_is_unlimited(self):
@@ -79,13 +95,13 @@ class MemorySafetyTests(unittest.TestCase):
             exp, request = self.make_experiment(Path(directory))
             with patch('moe_prune.research.MemoryGuard', create=True) as guard, patch('moe_prune.research.subprocess.Popen') as spawn:
                 guard.return_value.last = {}
-                guard.return_value.preflight.side_effect = MemoryError('insufficient GPU reserve')
-                with self.assertRaisesRegex(MemoryError, 'GPU reserve'):
+                guard.return_value.preflight.side_effect = RuntimeError('GPU counter unavailable')
+                with self.assertRaisesRegex(RuntimeError, 'GPU counter unavailable'):
                     exp.run('unsafe', request)
                 spawn.assert_not_called()
                 self.assertFalse((exp.root / 'jobs' / 'unsafe').exists())
                 failure = json.loads((exp.root / 'preflight-failures' / 'unsafe.json').read_text(encoding='utf-8'))
-                self.assertIn('GPU reserve', failure['reason'])
+                self.assertIn('GPU counter unavailable', failure['reason'])
                 guard.return_value.preflight.side_effect = None
                 guard.return_value.preflight.return_value = {}
                 guard.return_value.last = {}
@@ -94,20 +110,20 @@ class MemorySafetyTests(unittest.TestCase):
                     exp.run('unsafe', request)
                 self.assertTrue((exp.root / 'jobs' / 'unsafe' / 'measurement.json').exists())
 
-    def test_runtime_pressure_kills_process_and_records_failure(self):
+    def test_runtime_measurement_failure_kills_process_and_records_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             exp, request = self.make_experiment(Path(directory))
             with patch('moe_prune.research.MemoryGuard', create=True) as guard, \
                  patch('moe_prune.research.subprocess.Popen', side_effect=RunningEngine), \
                  patch('psutil.Process', return_value=Monitor()):
-                guard.return_value.preflight.return_value = {'commit_available_bytes': 100}
-                guard.return_value.last = {'commit_available_bytes': 1}
-                guard.return_value.check.side_effect = MemoryError('insufficient commit reserve')
-                with self.assertRaisesRegex(MemoryError, 'commit reserve'):
+                guard.return_value.preflight.return_value = {'ram_available_bytes': 100}
+                guard.return_value.last = {'ram_available_bytes': 1}
+                guard.return_value.check.side_effect = RuntimeError('GPU counter unavailable')
+                with self.assertRaisesRegex(RuntimeError, 'counter unavailable'):
                     exp.run('unsafe', request)
             self.assertTrue(RunningEngine.killed)
             failure = json.loads((exp.root / 'jobs' / 'unsafe' / 'failure.json').read_text(encoding='utf-8'))
-            self.assertIn('commit reserve', failure['reason'])
+            self.assertIn('counter unavailable', failure['reason'])
             self.assertFalse((exp.root / 'jobs' / 'unsafe' / 'measurement.json').exists())
 
     def test_cleanup_access_denied_still_kills_parent_and_preserves_error(self):
@@ -179,62 +195,37 @@ class MemorySafetyTests(unittest.TestCase):
             self.assertIsNotNone(created[0].poll())
             self.assertFalse(psutil.pid_exists(created[0].pid))
 
-    def test_preflight_reserves_full_model_workspace_and_gpu_headroom(self):
+    def test_preflight_preserves_model_estimate_and_warns_when_over_limit(self):
         with tempfile.TemporaryDirectory() as directory:
-            model = Path(directory) / 'model'
-            fixture(model)
-            request = {'model': str(model), 'n_gpu_layers': 99}
-            with patch('moe_prune.memory_safety._available_memory', return_value=(8 * GIB, 8 * GIB)), \
-                 patch('moe_prune.memory_safety.AdapterMemory') as adapter:
-                adapter.return_value.sample.return_value = (3 * GIB, GIB)
-                guard = MemoryGuard({}, request)
-                with self.assertRaisesRegex(MemoryError, 'GPU reserve'):
-                    guard.preflight()
-                guard.close()
+            model=Path(directory)/'model';fixture(model, experts=128, top_k=8)
+            request={'model':str(model),'n_gpu_layers':99}
+            with patch('moe_prune.memory_safety._ram_sample',return_value=(100,50,'fixture')), patch('moe_prune.memory_safety.AdapterMemory') as adapter, patch('builtins.print'):
+                adapter.return_value.sample.return_value=(100,97)
+                guard=MemoryGuard({},request)
+                observed=guard.preflight();guard.close()
+                self.assertGreater(observed['vram_estimated_model_bytes'],0)
+                self.assertTrue(any(e['resource']=='vram' and e['kind']=='predicted' for e in observed['warning_events']))
                 adapter.return_value.close.assert_called_once()
 
-    def test_runtime_guard_detects_each_memory_reserve_and_unknown_gpu(self):
-        with patch('moe_prune.memory_safety._available_memory') as memory, \
-             patch('moe_prune.memory_safety.AdapterMemory') as adapter:
-            guard = MemoryGuard({}, {'model': 'unused', 'n_gpu_layers': 1})
-            guard.gpu = adapter.return_value
-            memory.return_value = (4 * GIB - 1, 8 * GIB)
-            with self.assertRaisesRegex(MemoryError, 'RAM'):
-                guard.check()
-            memory.return_value = (8 * GIB, 4 * GIB - 1)
-            with self.assertRaisesRegex(MemoryError, 'commit'):
-                guard.check()
-            memory.return_value = (8 * GIB, 8 * GIB)
-            adapter.return_value.sample.return_value = (16 * GIB, 15 * GIB + 1)
-            with self.assertRaisesRegex(MemoryError, 'GPU'):
-                guard.check()
-            adapter.return_value.sample.side_effect = RuntimeError('GPU counter unavailable')
-            with self.assertRaisesRegex(RuntimeError, 'counter unavailable'):
-                guard.check()
+    def test_runtime_guard_warns_and_detects_unknown_gpu(self):
+        with patch('moe_prune.memory_safety._ram_sample',return_value=(100,19,'fixture')), patch('moe_prune.memory_safety.AdapterMemory') as adapter, patch('builtins.print'):
+            guard=MemoryGuard({},{});guard.gpu=adapter.return_value
+            adapter.return_value.sample.return_value=(100,98)
+            observed=guard.check()
+            self.assertTrue(observed['ram_warning']);self.assertTrue(observed['vram_warning'])
+            adapter.return_value.sample.side_effect=RuntimeError('GPU counter unavailable')
+            with self.assertRaisesRegex(RuntimeError,'counter unavailable'):guard.check()
             guard.close()
 
     def test_cpu_does_not_require_a_gpu_counter(self):
-        with patch('moe_prune.memory_safety._available_memory', return_value=(8 * GIB, 8 * GIB)), \
-             patch('moe_prune.memory_safety.AdapterMemory') as adapter:
-            guard = MemoryGuard({}, {'model': 'unused', 'n_gpu_layers': 0})
-            self.assertEqual(guard.preflight()['ram_available_bytes'], 8 * GIB)
-            adapter.assert_not_called()
-            guard.close()
+        with patch('moe_prune.memory_safety._ram_sample',return_value=(100,80,'fixture')), patch('moe_prune.memory_safety.AdapterMemory') as adapter:
+            guard=MemoryGuard({}, {'model':'unused','n_gpu_layers':0})
+            self.assertEqual(guard.preflight()['ram_available_bytes'],80)
+            adapter.assert_not_called();guard.close()
 
-    def test_gpu_counter_must_match_dxgi_adapter_and_be_valid(self):
-        with patch('moe_prune.memory_safety._amd_adapter', return_value={'capacity': 1000, 'luid': (0, 42)}), \
-             patch('moe_prune.memory_safety._PdhCounters') as counters:
-            sampler = AdapterMemory()
-            counters.return_value.read_named.return_value = {
-                r'\GPU Adapter Memory(luid_0x00000000_0x0000002a_phys_0)\Dedicated Usage': (0, 300),
-                r'\GPU Adapter Memory(luid_0x00000000_0x0000002b_phys_0)\Dedicated Usage': (0, 600)}
-            self.assertEqual(sampler.sample(), (1000, 300))
-            counters.return_value.read_named.return_value = {}
-            with self.assertRaisesRegex(RuntimeError, 'counter'):
-                sampler.sample()
-            sampler.close()
+    def test_gpu_counter_rejects_invalid_values(self):
+        with patch('moe_prune.memory_safety._ram_sample',return_value=(100,50,'fixture')):
+            guard=MemoryGuard({},{});guard.gpu=type('GPU',(),{'sample':lambda self:(100,101)})()
+            with self.assertRaisesRegex(RuntimeError,'GPU'):guard.check()
 
-
-if __name__ == '__main__':
-    unittest.main()
-
+if __name__ == '__main__': unittest.main()
