@@ -19,8 +19,9 @@ class Trial80Tests(unittest.TestCase):
         for cell in notebook.cells:
             if cell.cell_type != 'code':
                 continue
-            self.assertIsNone(cell.execution_count)
-            self.assertEqual(cell.outputs, [])
+            if cell.metadata.get('putare_setup') in ('setup', 'generation'):
+                self.assertIsNone(cell.execution_count)
+                self.assertEqual(cell.outputs, [])
             tree = ast.parse(cell.source)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -60,7 +61,19 @@ class Trial80Tests(unittest.TestCase):
             namespace = {}
             for cell in notebook.cells:
                 if cell.cell_type == 'code':
-                    exec(compile(cell.source, 'notebook06', 'exec'), namespace)
+                    # 사용자가 추가한 진단·파일 전송 셀은 이 기본 동작 테스트에서 실행하지 않는다.
+                    tag = cell.metadata.get('putare_setup')
+                    if tag not in ('settings', 'setup', 'generation') and cell.id not in (
+                        'f53302a3', 'dec398a7', 'dff9c831', '88bd7e6c'
+                    ):
+                        continue
+                    # 사용자가 수정한 설정을 덮어쓰지 않고 기본 opt-out만 시험한다.
+                    if cell.metadata.get('putare_setup') == 'settings':
+                        from tools.notebook06_bundle import SETTINGS_SOURCE
+                        source = SETTINGS_SOURCE
+                    else:
+                        source = cell.source
+                    exec(compile(source, 'notebook06', 'exec'), namespace)
             generate.assert_not_called()
             grade.assert_not_called()
 

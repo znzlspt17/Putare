@@ -16,6 +16,27 @@ VENV = ROOT / '.cache/putare-lcb/venv'
 SOURCE = ROOT / '.cache/putare-lcb/livecodebench' / COMMIT
 
 
+def _ensure_pip(venv_python, env):
+    # 2026-11-09: 부분 생성된 venv는 보존하고 pip만 현재 Python으로 복구한다.
+    probe_command = [str(venv_python), '-I', '-m', 'pip', '--version']
+    probe = subprocess.run(probe_command, capture_output=True, text=True, errors='replace', env=env)
+    if probe.returncode == 0:
+        return
+    message = (probe.stderr or '').strip()
+    if not message.endswith('No module named pip'):
+        raise RuntimeError('채점기 Python의 pip 확인 실패: ' + (message[-300:] or f'종료 코드 {probe.returncode}'))
+    command = [sys.executable, '-I', '-m', 'pip', '--isolated', '--python', str(venv_python),
+               'install', '--disable-pip-version-check', '--no-input', 'pip']
+    result = subprocess.run(command, capture_output=True, text=True, errors='replace', env=env)
+    if result.returncode != 0:
+        detail = (result.stderr or '').strip()[-300:]
+        raise RuntimeError('채점기 pip 복구 실패: ' + (detail or f'종료 코드 {result.returncode}'))
+    verified = subprocess.run(probe_command, capture_output=True, text=True, errors='replace', env=env)
+    if verified.returncode != 0:
+        detail = (verified.stderr or '').strip()[-300:]
+        raise RuntimeError('채점기 pip 복구 후 확인 실패: ' + (detail or f'종료 코드 {verified.returncode}'))
+
+
 def prepare(root=ROOT):
     root = Path(root).resolve()
     venv = root / '.cache/putare-lcb/venv'
@@ -26,7 +47,8 @@ def prepare(root=ROOT):
     env = worker_environment()
     if not (venv / 'bin/python').is_file():
         venv.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([sys.executable, '-m', 'venv', str(venv)], check=True, env=env)
+        subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(venv)], check=True, env=env)
+    _ensure_pip(venv / 'bin/python', env)
     # --isolated는 사용자 pip 설정과 인증 환경변수의 묵시적 사용을 배제한다.
     subprocess.run([str(venv / 'bin/python'), '-I', '-m', 'pip', '--isolated', 'install',
                     '--disable-pip-version-check', '--no-input',

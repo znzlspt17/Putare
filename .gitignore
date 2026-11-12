@@ -30,6 +30,7 @@ pytorch_model*.bin
 # 로컬 편집기·에이전트 설정
 .vscode/
 .idea/
+*.code-workspace
 .codex/
 download
 

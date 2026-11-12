@@ -18,9 +18,17 @@ subprocess.run([sys.executable, 'tools/native/prepare.py', '--backend', 'cuda',
 
 ## 계측과 GPU fusion
 
-연구 엔진은 동일한 계측 조건을 위해 GPU fusion을 비활성화하고
-gpu_fusion_disabled를 기록한다. 과거 환경과 다른 엔진·장비에서 얻은 결과는
-기존 결과와 구분하여 새 RUN_ID로 기록한다.
+기본값은 기존과 같이 CUDA fusion 비활성화 및 `full` 계측이다. 요청에
+`fusion_enabled: true`, `instrumentation_level: "routing"`을 지정하면 fusion을
+허용하고 각 토큰·계층의 Expert ID와 정규화된 gate만 기록한다. 이 경량 방식은
+`weighted_output_norms`를 계산하지 않으며 해당 큰 텐서를 CPU로 복사하지 않는다.
+
+`fusion_enabled`와 `gpu_fusion_disabled`는 backend 초기화 전 적용한 정책이며,
+특정 CUDA 커널이 실제 융합됐다는 실측 증거는 아니다. scheduler callback은
+계측 노드마다 그래프를 분리하고 동기화하므로 해당 경계를 가로지르는 fusion을
+제한할 수 있다. 토큰 또는 계층 계측이 누락되면 실행이 실패한다. 세션에서
+fusion·계측 방식을 바꾸려면 새 프로세스가 필요하다. 실제 GPU 동작과 속도는
+별도 실행으로 확인해야 하며, 과거 결과와 구분하여 새 RUN_ID로 기록한다.
 
 ## 원본 모델의 로컬 기준 측정
 
@@ -71,6 +79,8 @@ llama-expert-research --request request.json --output result.jsonl
 | `max_tokens`, `context_size` | 기본 256, 8192. 초과 시 자르지 않고 실패 |
 | `n_gpu_layers` | 기본 0. 실제 GPU offload 수는 실험 설정에서 명시 |
 | `instrumentation` | 기본 `profile`에서만 true. false일 때 관측 전송 생략 |
+| `instrumentation_level` | 기본 `full`: Expert 출력 norm 포함. `routing`: Expert ID와 정규화 weight만 기록 |
+| `fusion_enabled` | 기본 false. true면 CUDA fusion을 허용하되 실제 개별 fusion 여부는 미관측 |
 | `warmup` | 기본 false. true이면 계측 없는 generate에서 동일 프로세스의 prompt·1 decode를 준비한 후 KV를 지우고 측정. 워밍업 시간은 load/prefill/decode 지표에서 제외 |
 | `allowlist` | `{ "0": [0,1,...], ... }`; 모든 레이어를 포함하고 각각 Top-K 이상. 단일 계층 ablation을 위해 계층별 유지 수가 달라도 허용 |
 | `reference` | `reference_loss`에서 필수인 참조 답변 |

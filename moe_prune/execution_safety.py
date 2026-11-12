@@ -42,7 +42,7 @@ def check_released_memory(config=None):
 
 # 2026-11-09: 같은 런타임의 독립 커널에서도 추론과 채점이 겹치지 않도록 잠근다.
 @contextmanager
-def execution_guard(kind, *, memory_config=None):
+def execution_guard(kind, *, memory_config=None, monitor_gpu=True):
     if kind not in ('native', 'grading'):
         raise ValueError('unknown execution kind')
     import fcntl
@@ -61,7 +61,8 @@ def execution_guard(kind, *, memory_config=None):
                 if active:
                     raise RuntimeError(f"모델 프로세스가 실행 중이므로 채점하지 않습니다: {', '.join(active)}")
                 from .memory_safety import MemoryGuard
-                monitor = MemoryGuard({} if memory_config is None else memory_config, {'monitor_gpu': True})
+                # 2026-11-11: 보존된 답안의 독립 채점은 GPU 없이도 RAM과 프로세스 잠금을 유지한다.
+                monitor = MemoryGuard({} if memory_config is None else memory_config, {'monitor_gpu': monitor_gpu})
                 monitor.preflight()
             yield monitor
         finally:

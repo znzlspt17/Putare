@@ -26,6 +26,8 @@ static double elapsed(clock_type::time_point start) {
 struct observer {
     std::ofstream * output = nullptr;
     bool enabled = false;
+    std::string instrumentation_level = "full";
+    size_t expected_layers = 0;
     bool all_token_logits = false;
     std::string phase = "prefill";
     int position = 0;
@@ -60,7 +62,8 @@ static bool callback(ggml_tensor * tensor, bool ask, void * user) {
     if (suffix.empty() || !std::all_of(suffix.begin(), suffix.end(), [](char c) { return c >= '0' && c <= '9'; })) return false;
     const std::string kind = name.substr(0, dash);
     const bool mask = kind == "ffn_moe_logits" && !state.allow.empty();
-    const bool capture = state.enabled && (kind == "ffn_moe_topk" || kind == "ffn_moe_weights_norm" || kind == "ffn_moe_weighted");
+    const bool capture = state.enabled && (kind == "ffn_moe_topk" || kind == "ffn_moe_weights_norm" ||
+        (state.instrumentation_level == "full" && kind == "ffn_moe_weighted"));
     if (ask) return mask || capture;
     if (!mask && !capture) return true;
     try {
@@ -104,6 +107,35 @@ static bool callback(ggml_tensor * tensor, bool ask, void * user) {
                 for (int64_t token=0; token<tensor->ne[1]; ++token)
                     for (int64_t k=0; k<tensor->ne[0]; ++k)
                         gates.push_back(value_at<float>(bytes, token*tensor->nb[1] + k*tensor->nb[0]));
+            }
+            if (state.instrumentation_level == "routing") {
+                // 2026-11-09: 정규화 가중치와 선택 ID만 전송해 큰 expert 출력 복사와 norm 계산을 피한다.
+                const auto found = state.ids.find(layer);
+                if (found == state.ids.end() || found->second.size() != gates.size() ||
+                    gates.empty() || gates.size() % static_cast<size_t>(state.top_k) != 0)
+                    throw std::runtime_error("routing ids/gates shape or ordering mismatch");
+                const auto & ids = found->second;
+                const size_t tokens = gates.size() / static_cast<size_t>(state.top_k);
+                for (size_t token=0; token<tokens; ++token) {
+                    if (++state.records > state.max_records) throw std::runtime_error("routing record limit exceeded");
+                    json selected=json::array(), weights=json::array();
+                    std::set<int32_t> unique;
+                    double total=0;
+                    for (int k=0; k<state.top_k; ++k) {
+                        const size_t index=token*static_cast<size_t>(state.top_k)+static_cast<size_t>(k);
+                        const int32_t id=ids[index]; const float weight=gates[index];
+                        if(id<0 || !unique.insert(id).second || !std::isfinite(weight) || weight<0)
+                            throw std::runtime_error("invalid routing id or normalized weight");
+                        selected.push_back(id); weights.push_back(weight); total+=weight;
+                    }
+                    if(std::abs(total-1.0)>1e-4) throw std::runtime_error("normalized routing weights do not sum to one");
+                    *state.output << json({{"type","routing"},{"phase",state.phase},{"layer",layer},
+                        {"token_index",state.position+state.offsets[layer]+static_cast<int>(token)},
+                        {"expert_ids",selected},{"weights",weights}}).dump() << '\n';
+                }
+                state.offsets[layer] += static_cast<int>(tokens);
+                state.profiled_layers.insert(layer);
+                state.ids.erase(layer); state.gates.erase(layer);
             }
         } else {
             if (tensor->type != GGML_TYPE_F32) throw std::runtime_error("weighted output is not F32");
@@ -163,6 +195,15 @@ static void process(llama_context * context,llama_batch_ext * batch,const std::v
     if(llama_process(context,LLAMA_PROCESS_TYPE_DECODE,batch)!=0) throw std::runtime_error("llama_process failed: "+state.failure);
     llama_synchronize(context);
     if(!state.failure.empty()) throw std::runtime_error(state.failure);
+    if(state.enabled && state.instrumentation_level=="routing") {
+        // 2026-11-09: 일부 토큰 또는 계층에서 callback이 누락되면 조용히 결과를 쓰지 않는다.
+        if(state.offsets.size()!=state.expected_layers) throw std::runtime_error("routing callback missed a layer");
+        for(size_t layer=0;layer<state.expected_layers;++layer) {
+            auto found=state.offsets.find(static_cast<int>(layer));
+            if(found==state.offsets.end() || found->second!=static_cast<int>(tokens.size()))
+                throw std::runtime_error("routing callback missed or duplicated tokens");
+        }
+    }
 }
 static double nll(const float * logits,int count,int target) {
     if(target<0 || target>=count) throw std::runtime_error("reference token outside vocabulary");
@@ -196,7 +237,7 @@ int main(int argc,char ** argv) {
         const json request=json::parse(input);
         output.open(output_path,std::ios::out|std::ios::trunc); if(!output) throw std::runtime_error("output not writable");
         const std::string mode=request.value("mode",std::string("generate"));
-        if(mode!="generate" && mode!="profile" && mode!="logits" && mode!="reference_loss") throw std::runtime_error("unsupported mode");
+        if(mode!="generate" && mode!="profile" && mode!="logits" && mode!="reference_loss" && mode!="tokenize") throw std::runtime_error("unsupported mode");
         const int limit=request.value("max_tokens",256), n_ctx=request.value("context_size",8192);
         if(limit<0 || n_ctx<=0 || limit>n_ctx) throw std::runtime_error("invalid token/context limit");
         // 2026-11-06: 기존 연구 호출은 greedy를 보존하고 명시된 경우에만 모델 권장 샘플링을 사용한다.
@@ -210,7 +251,13 @@ int main(int argc,char ** argv) {
         if((cache_k!="f16" && cache_k!="q8_0") || (cache_v!="f16" && cache_v!="q8_0"))
             throw std::runtime_error("unsupported cache type");
         state=observer{}; state.output=&output; state.enabled=request.value("instrumentation",mode=="profile");
+        state.instrumentation_level=request.value("instrumentation_level",std::string("full"));
+        if(state.instrumentation_level!="full" && state.instrumentation_level!="routing")
+            throw std::runtime_error("unsupported instrumentation level");
+        const bool fusion_enabled=request.value("fusion_enabled",false);
         state.all_token_logits=request.value("all_token_logits",false);
+        if(state.enabled && state.instrumentation_level=="routing" && !state.all_token_logits)
+            throw std::runtime_error("routing instrumentation requires all_token_logits");
         const bool warmup=request.value("warmup",false);
         if(warmup && (state.enabled || mode!="generate")) throw std::runtime_error("warmup requires uninstrumented generate mode");
         state.max_records=request.value("max_routing_records",size_t(1000000));
@@ -221,20 +268,32 @@ int main(int argc,char ** argv) {
                 for(const int id:it.value()) if(!state.allow[layer].insert(id).second) throw std::runtime_error("duplicate expert id");
             }
         }
-        // 2026-11-09: CUDA fusion이 계측 경로에 영향을 줄 수 있으므로 동일한 비융합 경로를 사용한다.
-        if (setenv("GGML_CUDA_DISABLE_FUSION", "1", 1) != 0) throw std::runtime_error("failed to disable CUDA fusion");
         const json fixed={{"model",request.at("model")},{"n_gpu_layers",request.value("n_gpu_layers",0)},
+            {"vocab_only",mode=="tokenize"},
             {"context_size",n_ctx},{"cache_k",cache_k},{"cache_v",cache_v},
             {"flash_attention",request.value("flash_attention",false)},
             {"offload_kqv",request.value("offload_kqv",true)},
-            {"instrumentation",state.enabled},{"allowlist",request.value("allowlist",json(nullptr))}};
+            {"instrumentation",state.enabled},{"instrumentation_level",state.instrumentation_level},
+            {"fusion_enabled",fusion_enabled},{"allowlist",request.value("allowlist",json(nullptr))}};
         if(model && fixed!=session_config) throw std::runtime_error("session model/context configuration changed");
-        if(!backend_started) { llama_backend_init(); backend_started=true; }
+        if(!backend_started) {
+            // 2026-11-09: CUDA가 최초 조회 때 env를 캐시하므로 backend 초기화 전에 세션 정책을 고정한다.
+#ifdef _WIN32
+            if(_putenv_s("GGML_CUDA_DISABLE_FUSION",fusion_enabled ? "0" : "1")!=0)
+#else
+            if(setenv("GGML_CUDA_DISABLE_FUSION",fusion_enabled ? "0" : "1",1)!=0)
+#endif
+                throw std::runtime_error("failed to set CUDA fusion policy");
+            llama_backend_init(); backend_started=true;
+        }
         const auto load_start=clock_type::now();
         auto model_params=llama_model_default_params(); model_params.n_gpu_layers=request.value("n_gpu_layers",0);
+        // 2026-11-11: 비교 사전 점검은 가중치 적재나 평가 추론 없이 실제 chat template과 vocab만 사용한다.
+        model_params.vocab_only=(mode=="tokenize");
         const bool first=!model;
         if(first) { model=llama_model_load_from_file(request.at("model").get<std::string>().c_str(),model_params); session_config=fixed; }
         if(!model) throw std::runtime_error("model load failed");
+        state.expected_layers=static_cast<size_t>(llama_model_n_layer(model));
         char arch[128];
         if(llama_model_meta_val_str(model,"general.architecture",arch,sizeof(arch))<=0) throw std::runtime_error("missing model architecture");
         if(std::string(arch)!="gemma4") throw std::runtime_error("this observer supports gemma4 only");
@@ -264,6 +323,17 @@ int main(int argc,char ** argv) {
             prompt=common_chat_templates_apply(templates.get(),chat).prompt.str();
         }
         auto tokens=tokenize(vocab,prompt,true);
+        if(mode=="tokenize") {
+            if(tokens.empty() || tokens.size()>=static_cast<size_t>(n_ctx-1)) throw std::runtime_error("prompt exceeds context");
+            output << json({{"type","result"},{"rendered_prompt",prompt},{"tokens",tokens}}).dump() << '\n';
+            output.close();
+            if(!output) throw std::runtime_error("tokenization output failed");
+            if(!session) break;
+            std::cout << json({{"status","ok"}}).dump() << std::endl;
+            continue;
+        }
+        if(request.contains("expected_prompt_tokens") && request.at("expected_prompt_tokens")!=json(tokens))
+            throw std::runtime_error("prompt tokens differ from verified preflight");
         auto reference=mode=="reference_loss" ? tokenize(vocab,request.at("reference").get<std::string>(),false) : std::vector<llama_token>();
         const int needed=static_cast<int>(tokens.size())+(mode=="reference_loss"?static_cast<int>(reference.size()):limit);
         if(tokens.empty() || needed>n_ctx) throw std::runtime_error("prompt/output exceeds context; no silent truncation");
@@ -343,14 +413,34 @@ int main(int argc,char ** argv) {
             }
         }
         const double decode_seconds=elapsed(decode_start);
+        // 2026-11-11: 채널 경계가 토큰 경계와 일치할 때만 실제 출력 토큰을 분류한다.
+        json channel_tokens={{"thinking",nullptr},{"final",nullptr},{"control",nullptr},
+                             {"unclassified",generated.size()}};
+        const std::string thought_marker="<|channel>thought\n", boundary="<channel|>";
+        const size_t boundary_at=text.find(boundary);
+        if(text.rfind(thought_marker,0)==0 && boundary_at!=std::string::npos) {
+            std::vector<size_t> offsets={0};
+            for(const auto token:generated) offsets.push_back(offsets.back()+piece(vocab,token).size());
+            const size_t start=thought_marker.size(), end=boundary_at, final_start=end+boundary.size();
+            auto a=std::find(offsets.begin(),offsets.end(),start);
+            auto b=std::find(offsets.begin(),offsets.end(),end);
+            auto c=std::find(offsets.begin(),offsets.end(),final_start);
+            if(offsets.back()==text.size() && a!=offsets.end() && b!=offsets.end() && c!=offsets.end()) {
+                const size_t ai=static_cast<size_t>(a-offsets.begin()), bi=static_cast<size_t>(b-offsets.begin());
+                const size_t ci=static_cast<size_t>(c-offsets.begin());
+                channel_tokens={{"thinking",bi-ai},{"final",generated.size()-ci},
+                                {"control",ai+ci-bi},{"unclassified",0}};
+            }
+        }
         const size_t expected_layers=static_cast<size_t>(llama_model_n_layer(model));
         if(!state.allow.empty() && state.masked_layers.size()!=expected_layers) throw std::runtime_error("mask callback did not observe every layer; graph unsupported");
         if(state.enabled && state.profiled_layers.size()!=expected_layers) throw std::runtime_error("profiling callbacks did not observe every layer; graph unsupported");
         if(mode=="logits") {
             for(const auto & value:final_logits) if(!std::isfinite(value.get<float>())) throw std::runtime_error("nonfinite final logits");
         }
-        json result={{"type","result"},{"runtime_commit",RESEARCH_LLAMA_COMMIT},{"gpu_fusion_disabled",true},{"mode",mode},
-            {"text",text},{"token_ids",generated},{"logits",final_logits},
+        json result={{"type","result"},{"runtime_commit",RESEARCH_LLAMA_COMMIT},{"gpu_fusion_disabled",!fusion_enabled},
+            {"fusion_enabled",fusion_enabled},{"instrumentation_level",state.instrumentation_level},{"mode",mode},
+            {"text",text},{"token_ids",generated},{"channel_tokens",channel_tokens},{"logits",final_logits},
             {"reference_nll",reference.empty()?json(nullptr):json(loss/reference.size())},{"reference_tokens",reference.size()},
             {"stop_reason",stop_reason},{"prompt_tokens",tokens.size()},{"seed",request.value("seed",42)},
             {"sampling",{{"temperature",temperature},{"top_p",top_p},{"top_k",sample_top_k},{"strategy",sampler?"sampled":"greedy"}}},{"instrumentation",state.enabled},
@@ -363,6 +453,7 @@ int main(int argc,char ** argv) {
             {"routing_records",state.records},{"profiled_layers",state.profiled_layers},{"masked_layers",state.masked_layers},
             {"gpu_memory_bytes",nullptr},{"cpu_gpu_placement",nullptr},{"expert_transfer_bytes",nullptr},
             {"timings",{{"load_s",load_seconds},{"ttft_s",mode=="logits" || mode=="reference_loss"?json(nullptr):json(ttft)},
+                {"prefill_s",prefill_seconds},{"decode_s",decode_seconds},
                 {"prefill_tokens_s",tokens.size()/prefill_seconds},{"decode_tokens_s",generated.size()>1?json((generated.size()-1)/decode_seconds):json(nullptr)}}}};
         output << result.dump(-1,' ',false,json::error_handler_t::replace) << '\n'; output.flush();
         if(!output) throw std::runtime_error("result output failed");

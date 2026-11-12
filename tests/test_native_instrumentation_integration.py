@@ -6,6 +6,8 @@ from pathlib import Path
 
 from moe_prune.datasets import load_snapshot
 from moe_prune.research import Experiment
+from moe_prune.research import read_jsonl
+from moe_prune.base_benchmark import validate_routing
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,6 +34,28 @@ class NativeInstrumentationIntegrationTests(unittest.TestCase):
             events = list(exp.routing("decode", [record]))
             self.assertTrue(any(e["phase"] == "prefill" for e in events))
             self.assertTrue(any(e["phase"] == "decode" for e in events))
+
+    def test_fusion_enabled_lightweight_routing_covers_all_tokens(self):
+        # 명시적 실 GPU 테스트: 결과가 나오더라도 개별 CUDA 커널 융합 자체의 증거는 아니다.
+        model = ROOT / "models/gemma-4-26B-A4B-it-UD-IQ4_NL.gguf"
+        config = {"seed": 42, "context_size": 16384, "n_gpu_layers": 31,
+                  "ram_usage_warn_fraction": .80, "vram_usage_warn_fraction": .97,
+                  "engine": str(ROOT / ".cache/llama-build/bin/llama-expert-research")}
+        request = {'model': str(model), 'prompt': 'What is two plus two?', 'mode': 'profile',
+                   'max_tokens': 4, 'context_size': 16384, 'n_gpu_layers': 31,
+                   'instrumentation': True, 'instrumentation_level': 'routing',
+                   'fusion_enabled': True, 'all_token_logits': True}
+        with tempfile.TemporaryDirectory() as temp:
+            exp = Experiment(Path(temp), config)
+            result = exp.run('fusion-routing', request)
+            events = list(read_jsonl(exp.root / 'jobs/fusion-routing/events.jsonl'))
+            self.assertIs(result['fusion_enabled'], True)
+            self.assertIs(result['gpu_fusion_disabled'], False)
+            self.assertEqual(result['instrumentation_level'], 'routing')
+            self.assertEqual(validate_routing(events, result), result['routing_records'])
+            rows = [row for row in events if row.get('type') == 'routing']
+            self.assertTrue(rows)
+            self.assertTrue(all('weighted_output_norms' not in row for row in rows))
 
 
 if __name__ == "__main__":

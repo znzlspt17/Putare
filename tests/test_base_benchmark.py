@@ -191,6 +191,45 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(request['all_token_logits'])
         self.assertEqual(request['system_prompt'], 'Solve carefully')
 
+    def test_optional_fusion_and_routing_mode_are_explicit(self):
+        record = {'id': 'q', 'prompt': 'question'}
+        old = build_request(record, 'original.gguf', (31, True), {})
+        self.assertNotIn('fusion_enabled', old)
+        self.assertNotIn('instrumentation_level', old)
+        request = build_request(record, 'original.gguf', (31, True),
+                                {'fusion_enabled': True, 'instrumentation_level': 'routing',
+                                 'context_size': 262144, 'max_tokens': 65536})
+        self.assertIs(request['fusion_enabled'], True)
+        self.assertEqual(request['instrumentation_level'], 'routing')
+        self.assertEqual((request['context_size'], request['max_tokens']), (262144, 65536))
+
+    def test_lightweight_routing_requires_all_positions_and_valid_normalized_gates(self):
+        events = [{k: v for k, v in event(layer, 'prefill', token).items() if k != 'weighted_output_norms'}
+                  for token in range(2) for layer in range(2)]
+        events += [{k: v for k, v in event(layer, 'decode', 2).items() if k != 'weighted_output_norms'}
+                   for layer in range(2)]
+        result = {'prompt_tokens': 2, 'processed_decode_tokens': 1, 'instrumentation_level': 'routing'}
+        self.assertEqual(validate_routing(iter(events), result, layers=2, experts=4, top_k=2), 6)
+        for bad in (events[:-1], events + [events[0]], [{**events[0], 'weights': [.8, .8]}] + events[1:],
+                    [{**events[0], 'expert_ids': [1, 1]}] + events[1:]):
+            with self.subTest(bad=bad[:1]), self.assertRaises(ValueError):
+                validate_routing(iter(bad), result, layers=2, experts=4, top_k=2)
+        with self.assertRaises(ValueError):
+            validate_routing(iter(events), {**result, 'instrumentation_level': 'full'}, layers=2, experts=4, top_k=2)
+
+    def test_runtime_rejects_fusion_or_observer_policy_mismatch(self):
+        request = {'context_size': 262144, 'offload_kqv': True, 'fusion_enabled': True,
+                   'instrumentation_level': 'routing'}
+        result = {'actual_context_size': 262144, 'instrumentation': True, 'flash_attention_requested': True,
+                  'offload_kqv_requested': True, 'seed': 42, 'gpu_fusion_disabled': False,
+                  'fusion_enabled': True, 'instrumentation_level': 'routing',
+                  'sampling': {'strategy': 'sampled', 'temperature': 1.0, 'top_p': .95, 'top_k': 64}}
+        log = 'llama_context: flash_attn = enabled\nllama_kv_cache: K (q8_0): 1 V (q8_0): 1\n'
+        verify_runtime(result, log, request)
+        for altered in ({'fusion_enabled': False}, {'gpu_fusion_disabled': True}, {'instrumentation_level': 'full'}):
+            with self.subTest(altered=altered), self.assertRaises(ValueError):
+                verify_runtime({**result, **altered}, log, request)
+
     def test_validation_requires_each_layer_and_token_once(self):
         events = [event(layer, 'prefill', token) for token in range(2) for layer in range(2)]
         events += [event(layer, 'decode', 2) for layer in range(2)]

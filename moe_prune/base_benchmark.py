@@ -50,6 +50,14 @@ def verify_runtime(result, stderr, request):
     """2026-11-06: 요청 필드만이 아니라 실제 llama backend 로그의 cache/FA를 확인한다."""
     if not result.get('instrumentation') or not result.get('flash_attention_requested'):
         raise ValueError('계측 또는 Flash Attention 요청 누락')
+    # 2026-11-09: backend가 보고한 설정을 요청과 비교한다. 실제 개별 커널 fusion 여부의 증명은 아니다.
+    if 'fusion_enabled' in request:
+        enabled = request['fusion_enabled']
+        if (type(enabled) is not bool or result.get('fusion_enabled') is not enabled
+                or result.get('gpu_fusion_disabled') is not (not enabled)):
+            raise ValueError('CUDA fusion 설정 불일치')
+    if 'instrumentation_level' in request and result.get('instrumentation_level') != request['instrumentation_level']:
+        raise ValueError('계측 방식 불일치')
     if result.get('offload_kqv_requested') != request['offload_kqv']:
         raise ValueError('KV 배치 요청 불일치')
     if result.get('actual_context_size', 0) < request['context_size']:
@@ -88,6 +96,9 @@ def build_request(record, model, placement, config):
                'all_token_logits': True,
                'seed': c['seed'], 'sampling': {'temperature': 1.0, 'top_p': .95, 'top_k': 64},
                'max_routing_records': c['context_size'] * 30}
+    for name in ('fusion_enabled', 'instrumentation_level'):
+        if name in config:
+            request[name] = config[name]
     if record.get('system_prompt'):
         request['system_prompt'] = record['system_prompt']
     return request
@@ -106,6 +117,9 @@ def validate_routing(events, result, layers=30, experts=128, top_k=8):
             raise ValueError('생성 토큰과 계측된 decode 토큰 수 불일치')
     expected = {(phase, layer): (0 if phase == 'prefill' else prompt)
                 for phase in ('prefill', 'decode') for layer in range(layers)}
+    level = result.get('instrumentation_level', 'full')
+    if level not in ('full', 'routing'):
+        raise ValueError('알 수 없는 계측 방식')
     count = 0
     for row in events:
         if row.get('type') != 'routing':
@@ -115,13 +129,16 @@ def validate_routing(events, result, layers=30, experts=128, top_k=8):
         if key not in expected or type(layer) is not int or row.get('token_index') != expected[key]:
             raise ValueError(f'계측 위치 누락 또는 중복: {key}')
         ids, weights, norms = row.get('expert_ids'), row.get('weights'), row.get('weighted_output_norms')
-        if not all(isinstance(x, list) and len(x) == top_k for x in (ids, weights, norms)):
+        vectors = (ids, weights, norms) if level == 'full' else (ids, weights)
+        if not all(isinstance(x, list) and len(x) == top_k for x in vectors):
             raise ValueError('계측 벡터 형상 오류')
         if len(set(ids)) != top_k or any(type(x) is not int or not 0 <= x < experts for x in ids):
             raise ValueError('Expert ID 오류')
         if any(not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x) or x < 0
-               for x in weights + norms):
+               for x in weights + (norms if level == 'full' else [])):
             raise ValueError('계측값 오류')
+        if level == 'routing' and not math.isclose(sum(weights), 1.0, rel_tol=1e-4, abs_tol=1e-4):
+            raise ValueError('정규화된 Expert 가중치 합 오류')
         expected[key] += 1
         count += 1
     for (phase, layer), end in expected.items():
